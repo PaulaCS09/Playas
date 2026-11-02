@@ -4,12 +4,18 @@
 # y fuerza el redespliegue de los servicios ECS.
 #
 # Uso:
-#   ./scripts/deploy.sh [--auto-approve]
+#   ./scripts/deploy.sh
+#
+# terraform apply siempre pide confirmación humana: el script exige una
+# terminal interactiva y rechaza --auto-approve. Antes del apply copia el
+# state local a TFSTATE_BACKUP_DIR (default: ~/tfstate-backups), fuera del clon.
 #
 # Requisitos:
 #   - rag/infrastructure/terraform.tfvars con todas las variables configuradas
 #   - Credenciales AWS exportadas en el entorno
 set -euo pipefail
+# El state local y sus respaldos contienen secretos: legibles solo por el dueño.
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INFRA_DIR="${SCRIPT_DIR}/.."
@@ -27,10 +33,60 @@ log()  { echo -e "${bold}▶ $*${reset}"; }
 ok()   { echo -e "${green}✓ $*${reset}"; }
 warn() { echo -e "${yellow}⚠ $*${reset}"; }
 
-# ── Helpers de reconciliación ─────────────────────────────────────────────────
-# Si un SG existe en AWS con distinto ID al del state (o sin estado), lo importa.
-# Evita el error "already exists for VPC" en apply tras un destroy parcial.
-reconcile_sg() {
+# ── 0. Salvaguardas: confirmación humana ──────────────────────────────────────
+if [[ $# -gt 0 ]]; then
+  echo "✗ Argumento no admitido: $1. terraform apply requiere confirmación humana; --auto-approve no está permitido." >&2
+  exit 1
+fi
+if [[ ! -t 0 ]]; then
+  echo "✗ Se requiere una terminal interactiva para confirmar terraform apply (en SSH, usar ssh -t)." >&2
+  exit 1
+fi
+# Estas variables pueden inyectar -auto-approve, -upgrade o desactivar el prompt.
+for tf_var in TF_CLI_ARGS TF_CLI_ARGS_init TF_CLI_ARGS_plan TF_CLI_ARGS_apply TF_INPUT; do
+  if [[ -n "${!tf_var:-}" ]]; then
+    echo "✗ ${tf_var} está definida; puede omitir la confirmación de terraform apply. Ejecuta: unset ${tf_var}" >&2
+    exit 1
+  fi
+done
+
+# backup_state <directorio_terraform> <nombre_stack>
+# Copia el state local (si existe) fuera del clon, con permisos 600, y deja el
+# state original también en 600: contiene los valores de las variables sensibles.
+backup_state() {
+  local tf_dir="$1" stack="$2" dest
+  if [[ -e "${tf_dir}/.terraform.tfstate.lock.info" ]]; then
+    echo "✗ Existe ${tf_dir}/.terraform.tfstate.lock.info: otro proceso de Terraform puede estar en curso." >&2
+    exit 1
+  fi
+  if [[ ! -f "${tf_dir}/terraform.tfstate" ]]; then
+    warn "No hay terraform.tfstate local en ${stack}; no hay nada que respaldar"
+    return 0
+  fi
+  dest="${TFSTATE_BACKUP_DIR:-${HOME}/tfstate-backups}/${stack}/$(date +%Y%m%d-%H%M%S)-$$"
+  (
+    umask 077
+    mkdir -p "${dest}"
+    cp -pL "${tf_dir}"/terraform.tfstate* "${dest}/"
+    chmod 600 "${dest}"/terraform.tfstate* "${tf_dir}"/terraform.tfstate*
+  )
+  ok "State respaldado en ${dest}"
+}
+
+# restrict_state <directorio_terraform>: deja el state escrito por apply en 600.
+restrict_state() {
+  local tf_dir="$1"
+  if compgen -G "${tf_dir}/terraform.tfstate*" > /dev/null; then
+    chmod 600 "${tf_dir}"/terraform.tfstate*
+  fi
+}
+
+# ── Verificación de security groups ───────────────────────────────────────────
+# Detecta un SG que existe en AWS con un ID distinto al del state (p. ej., tras
+# un destroy parcial). No modifica el state: se detiene e indica los comandos
+# para que una persona los revise y ejecute manualmente.
+SG_DRIFT=0
+check_sg_drift() {
   local resource="$1" sg_name="$2" vpc_id="$3"
   local aws_id state_id
 
@@ -40,41 +96,49 @@ reconcile_sg() {
 
   [[ -z "${aws_id}" || "${aws_id}" == "None" ]] && return 0
 
-  state_id=$(terraform -chdir="${INFRA_DIR}" state show "${resource}" 2>/dev/null \
-    | grep -E '^\s+id\s+=' | sed 's/.*"\(.*\)"/\1/')
+  # Lectura del state (solo lectura). Si el recurso no está en el state,
+  # state_id queda vacío en lugar de abortar el script por pipefail.
+  state_id=$( { terraform -chdir="${INFRA_DIR}" state show -no-color "${resource}" 2>/dev/null \
+    | grep -E '^\s+id\s+=' | sed 's/.*"\(.*\)"/\1/'; } || true)
 
   [[ "${state_id}" == "${aws_id}" ]] && return 0
 
-  warn "SG '${sg_name}' existe en AWS (${aws_id}) pero el state tiene '${state_id:-<vacío>}' — reimportando..."
-  terraform -chdir="${INFRA_DIR}" state rm "${resource}" 2>/dev/null || true
-  terraform -chdir="${INFRA_DIR}" import "${resource}" "${aws_id}"
-  ok "Importado ${resource} → ${aws_id}"
+  warn "SG '${sg_name}' existe en AWS (${aws_id}) pero el state tiene '${state_id:-<vacío>}'."
+  echo "  Revisar antes de continuar. El state ya se respaldó. Si procede, una persona debe ejecutar manualmente:"
+  [[ -n "${state_id}" ]] && echo "    terraform -chdir=\"${INFRA_DIR}\" state rm ${resource}"
+  echo "    terraform -chdir=\"${INFRA_DIR}\" import ${resource} ${aws_id}"
+  SG_DRIFT=1
 }
 
 # ── 1. Terraform init ─────────────────────────────────────────────────────────
 log "Inicializando Terraform en rag/infrastructure..."
-terraform -chdir="${INFRA_DIR}" init -upgrade
+# Sin -upgrade: respeta las versiones fijadas en .terraform.lock.hcl.
+terraform -chdir="${INFRA_DIR}" init
 
-# ── 1b. Reconciliar security groups con AWS ───────────────────────────────────
+# Respaldo antes de verificar los SG: si hay que corregir el state a mano,
+# ya existe una copia.
+backup_state "${INFRA_DIR}" "rag-infrastructure"
+
+# ── 1b. Verificar security groups contra AWS (sin modificar el state) ─────────
 log "Verificando security groups existentes en AWS..."
 VPC_ID=$(aws ec2 describe-vpcs \
   --filters "Name=isDefault,Values=true" \
   --query 'Vpcs[0].VpcId' --output text --region "${REGION}")
 
-reconcile_sg "aws_security_group.alb"      "${NAME_PREFIX}-alb"      "${VPC_ID}"
-reconcile_sg "aws_security_group.app"      "${NAME_PREFIX}-app"      "${VPC_ID}"
-reconcile_sg "aws_security_group.efs"      "${NAME_PREFIX}-efs"      "${VPC_ID}"
-reconcile_sg "aws_security_group.frontend" "${NAME_PREFIX}-frontend" "${VPC_ID}"
+check_sg_drift "aws_security_group.alb"      "${NAME_PREFIX}-alb"      "${VPC_ID}"
+check_sg_drift "aws_security_group.app"      "${NAME_PREFIX}-app"      "${VPC_ID}"
+check_sg_drift "aws_security_group.efs"      "${NAME_PREFIX}-efs"      "${VPC_ID}"
+check_sg_drift "aws_security_group.frontend" "${NAME_PREFIX}-frontend" "${VPC_ID}"
 
-# ── 2. Terraform apply ────────────────────────────────────────────────────────
-log "Aplicando infraestructura ECS..."
-
-APPLY_ARGS=()
-if [[ "${1:-}" == "--auto-approve" ]]; then
-  APPLY_ARGS+=("-auto-approve")
+if [[ "${SG_DRIFT}" -ne 0 ]]; then
+  echo "✗ El state no coincide con los security groups de AWS. Despliegue detenido sin cambios." >&2
+  exit 1
 fi
 
-terraform -chdir="${INFRA_DIR}" apply "${APPLY_ARGS[@]}"
+# ── 2. Terraform apply ────────────────────────────────────────────────────────
+log "Aplicando infraestructura ECS (requiere confirmación)..."
+terraform -chdir="${INFRA_DIR}" apply -input=true
+restrict_state "${INFRA_DIR}"
 
 # ── 3. Construir y subir imágenes a ECR ───────────────────────────────────────
 log "Construyendo y subiendo imágenes a ECR..."

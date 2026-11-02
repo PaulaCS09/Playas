@@ -48,7 +48,7 @@ Postgres corre en la misma tarea Fargate que el backend.
 
 | Script | Qué hace |
 |---|---|
-| `deploy.sh [--auto-approve]` | Inicializa Terraform, aplica la infraestructura, construye y sube las imágenes, fuerza el redespliegue de los servicios ECS. Requiere `terraform.tfvars` completo y credenciales AWS en el entorno. |
+| `deploy.sh` | Inicializa Terraform (sin `-upgrade`), respalda el state local en `~/tfstate-backups/`, aplica la infraestructura con confirmación humana, construye y sube las imágenes, fuerza el redespliegue de los servicios ECS. Requiere una terminal interactiva, `terraform.tfvars` completo y credenciales AWS en el entorno. No admite `--auto-approve` y no modifica el state si detecta security groups desalineados: se detiene e indica los comandos manuales. |
 | `push_images.sh [TAG]` | Construye las imágenes de backend/frontend y las sube a los repositorios ECR (lee las URLs desde los outputs de Terraform). Tag por defecto: `latest`. |
 | `start.sh` | Enciende **todo** el cómputo de la aplicación: primero las EC2 de ChromaDB y Ollama (descubiertas por tag, sin Terraform), verificadas por HTTP; luego, solo si responden, los servicios ECS `app` y `frontend`. No termina hasta comprobar por HTTP que el backend (`/api/ready`) y el frontend responden — ver detalle abajo. |
 | `stop.sh` | Apaga **todo** el cómputo en el orden inverso: primero ECS (confirmando, con una sola consulta agregada, que AMBOS servicios quedaron simultáneamente en `desired=running=pending=0`), y solo entonces las EC2 de ChromaDB/Ollama. No depende del ALB ni de `curl` en ningún punto. Los datos de Postgres (EFS) y de ChromaDB/Ollama (EBS) se conservan. |
@@ -153,8 +153,21 @@ terraform apply
 O con el script que encadena todo:
 
 ```bash
-./scripts/deploy.sh --auto-approve
+./scripts/deploy.sh   # pide confirmación antes del apply
 ```
+
+## Security groups desalineados con el state
+
+Antes, `deploy.sh` reimportaba automáticamente un security group que existía en
+AWS con un ID distinto al del state (por ejemplo, tras un destroy parcial). Ahora
+el script respalda el state, se detiene sin modificarlo e imprime los comandos
+`terraform state rm` / `terraform import` correspondientes. Para recuperarse:
+
+1. Confirmar en la consola o con `aws ec2 describe-security-groups` que el SG
+   indicado es el que debe gestionar Terraform.
+2. Comprobar que existe el respaldo en `~/tfstate-backups/rag-infrastructure/`.
+3. Ejecutar manualmente los comandos impresos.
+4. Volver a lanzar `./scripts/deploy.sh` y revisar el plan antes de confirmar.
 
 ## Destruir la infraestructura
 
