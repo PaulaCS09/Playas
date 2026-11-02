@@ -155,6 +155,14 @@ variable "register_enabled" {
   default     = true
 }
 
+# ── EFS ───────────────────────────────────────────────────────────────────────
+
+variable "enable_efs_backup" {
+  description = "Activa la política de AWS Backup del EFS de Postgres. Requiere comprobar antes que AWS Backup está disponible en la cuenta (no verificado en AWS Academy)."
+  type        = bool
+  default     = false
+}
+
 # ── S3 ────────────────────────────────────────────────────────────────────────
 
 variable "s3_bucket_name" {
