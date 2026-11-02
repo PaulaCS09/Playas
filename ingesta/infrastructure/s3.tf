@@ -12,6 +12,13 @@ resource "aws_s3_bucket" "data" {
   tags = merge(local.common_tags, {
     Name = local.bucket_name
   })
+
+  # Contiene el corpus (raw/bronze/silver/gold): bloquea destroy y reemplazos
+  # accidentales. Sin force_destroy, AWS además rechaza borrar un bucket con
+  # objetos. Ver "Protección del bucket" en ingesta/README.md.
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_s3_bucket_versioning" "data" {

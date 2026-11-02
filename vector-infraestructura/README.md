@@ -142,18 +142,75 @@ uv run python3 ../data/import_to_chromadb.py \
 
 ## Archivos de importación
 
-El script toma el `.jsonl.gz` más reciente que encuentre en `data/`. Para generar un nuevo archivo de exportación desde una instancia ChromaDB existente consulta la documentación de la pipeline de ingesta.
+El script toma el `.jsonl.gz` más reciente que encuentre en `data/`. Estos archivos incluyen los embeddings, por lo que reimportarlos con `data/import_to_chromadb.py` no requiere Ollama. En `main` no hay todavía un exportador de ChromaDB: antes de cualquier operación que pueda perder el índice, conservar el `.jsonl.gz` usado en la última importación y un snapshot manual del volumen raíz de la EC2.
 
 ---
 
-## Destruir la infraestructura
+## Persistencia de los datos
 
-```bash
-cd vector-infraestructura
-terraform destroy
-```
+ChromaDB guarda el índice en `/opt/chroma-data`, en el **volumen raíz** (EBS gp3
+de 30 GB) de su EC2. Ollama guarda los modelos en el volumen raíz de la suya.
 
-> Las Elastic IPs se liberan automáticamente. Los datos en las EC2 **no persisten** — si necesitas conservar el índice ChromaDB, exporta la colección antes de destruir.
+| Operación | Datos de ChromaDB / modelos de Ollama |
+|---|---|
+| `stop.sh` / `start.sh` (detener y arrancar) | Se conservan: el EBS raíz persiste y el contenedor se reinicia solo |
+| Reemplazo de la instancia (`-replace`, cambio de AMI, cambio que fuerce reemplazo) | **Se pierden**: el volumen raíz se borra con la instancia |
+| `terraform destroy` | **Se pierden** |
+
+Para evitar pérdidas accidentales, `aws_instance.chromadb` y `aws_instance.ollama`
+tienen `lifecycle { prevent_destroy = true; ignore_changes = [ami, user_data] }`:
+
+- Una AMI nueva de Canonical (el data source usa `most_recent`) o un cambio en
+  los scripts de arranque **no** generan un reemplazo; el plan no los muestra.
+  `user_data` solo se ejecuta en el primer arranque, así que un cambio en
+  `scripts/ec2_*.sh` solo afecta a instancias nuevas.
+- Cualquier plan que destruya o reemplace una de estas EC2 falla con
+  `Instance cannot be destroyed`, incluido `terraform destroy`.
+- `prevent_destroy` solo actúa sobre planes de Terraform. No impide terminar la
+  instancia, borrar su volumen o cambiarla desde la consola o la CLI de AWS, ni
+  `terraform state rm`. Con state local, si el state se pierde, las EC2 quedan
+  fuera de Terraform y un `apply` posterior intentaría crear todo de nuevo en
+  lugar de reconocer lo existente: fallaría por los security groups con el mismo
+  nombre o dejaría recursos duplicados (EIPs, instancias vacías). Resguardar el state (los scripts de
+  despliegue lo copian a `~/tfstate-backups/`) y no modificar estos recursos
+  fuera de Terraform.
+
+### Actualizar deliberadamente la AMI o el `user_data`
+
+Con `ignore_changes = [ami, user_data]`, ni una AMI nueva ni un cambio en
+`scripts/ec2_*.sh` aparecen en el plan. Aplicarlos implica recrear la instancia
+(la AMI no se cambia in-place y `user_data` solo corre en el primer arranque),
+así que se sigue el procedimiento de la sección siguiente: respaldar, retirar
+temporalmente `prevent_destroy`, revisar `terraform plan -replace=...` y aplicar.
+Con `-replace` no hace falta retirar `ignore_changes`. Alternativa para la AMI:
+retirar también `ami` de `ignore_changes` en ese mismo cambio revisado y
+comprobar que el plan muestra `must be replaced` solo en la instancia prevista.
+No retirar `user_data` para este fin: el provider lo actualiza in-place
+(detiene y arranca la instancia) sin volver a ejecutar el script, así que no
+aplica el cambio; usar `-replace`. Restaurar las protecciones retiradas en un
+cambio posterior.
+
+## Reemplazar o destruir las EC2
+
+Hacerlo solo de forma consciente y revisada:
+
+1. Conservar el índice: el `.jsonl.gz` de la última importación (en `data/`) y,
+   si el índice cambió desde entonces, un snapshot manual del volumen raíz.
+2. En un cambio revisado, quitar temporalmente `prevent_destroy` del recurso
+   afectado. No hace falta tocar `ignore_changes`: con `-replace`, la instancia
+   nueva se crea con la AMI más reciente y el `user_data` actuales.
+3. `terraform plan -replace=aws_instance.chromadb` (o `plan -destroy`) y
+   comprobar que solo se reemplaza o destruye lo previsto. Después
+   `terraform apply -replace=aws_instance.chromadb` o `terraform destroy`,
+   confirmando en el prompt.
+4. Si se recreó ChromaDB: reimportar con `data/import_to_chromadb.py` y comprobar
+   el recuento de documentos. Si se recreó Ollama: su `user_data` vuelve a
+   descargar `embeddinggemma`, y el RAG no funcionará hasta que termine. La
+   Elastic IP se reasocia sola, así que `chroma_host`/`ollama_base_url` no cambian.
+5. Restaurar `prevent_destroy` en un cambio posterior: debe estar fuera de la
+   configuración durante ese `apply`.
+
+> Las Elastic IPs se liberan con `terraform destroy`.
 
 ---
 

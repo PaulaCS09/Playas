@@ -34,8 +34,8 @@ inicializado localmente — solo requieren AWS CLI 2.x (y `curl`, únicamente
 |---|---|
 | `ecs.tf` | Clúster ECS, definición de tarea (backend + sidecar Postgres en la misma tarea), servicios `app` y `frontend` |
 | `alb.tf` | Application Load Balancer, listeners, target groups |
-| `ecr.tf` | Repositorios ECR para las imágenes de backend y frontend |
-| `efs.tf` | Volumen EFS para los datos de Postgres (persisten entre despliegues) |
+| `ecr.tf` | Repositorios ECR para las imágenes de backend y frontend (`force_delete = false`) |
+| `efs.tf` | Volumen EFS para los datos de Postgres (persisten entre despliegues; `prevent_destroy`). Política opcional de AWS Backup con `enable_efs_backup` (desactivada por defecto) |
 | `security_groups.tf` | Grupos de seguridad de ALB/ECS/EFS |
 | `iam.tf` | Roles y políticas de ejecución/tarea de ECS |
 | `variables.tf` | Todas las variables de entrada (ver `terraform.tfvars.example`) |
@@ -169,12 +169,40 @@ el script respalda el state, se detiene sin modificarlo e imprime los comandos
 3. Ejecutar manualmente los comandos impresos.
 4. Volver a lanzar `./scripts/deploy.sh` y revisar el plan antes de confirmar.
 
+## Protección de datos
+
+- `aws_efs_file_system.postgres` tiene `prevent_destroy = true`: cualquier plan
+  que lo destruya o reemplace falla, incluido `terraform destroy` del stack.
+- Los repositorios ECR tienen `force_delete = false`: `destroy` falla si aún
+  contienen imágenes, en lugar de borrarlas sin aviso. En un stack existente, el
+  primer plan tras este cambio muestra dos updates in-place de `force_delete`
+  (`true -> false`): solo cambian el state, no los repositorios.
+- `enable_efs_backup` (por defecto `false`) crea una `aws_efs_backup_policy`
+  que activa las copias automáticas de EFS: AWS Backup crea el plan y el vault
+  `aws/efs/automatic-backup-*` (copia diaria, retención de 35 días) y ejecuta
+  los jobs con `AWSBackupDefaultServiceRole`. En AWS Academy `LabRole` no puede
+  crear ese rol: el `apply` puede terminar bien y los jobs fallar sin aviso.
+  Tras activarla, comprobar `aws backup list-backup-jobs` y probar una
+  restauración. Las copias se facturan aunque el lab esté detenido, y los
+  recovery points se conservan hasta caducar aunque se desactive la política.
+- El respaldo soportado es `scripts/export_postgres.sh`: deja el dump en
+  `data/backups/` (S3 se usa como puente y conserva una copia salvo
+  `--delete-remote`).
+- `prevent_destroy` protege frente a Terraform, no frente a la consola, la CLI
+  ni `terraform state rm`. Con state local, perder el state deja el EFS
+  huérfano y un `apply` posterior crearía otro: resguardar el state.
+
 ## Destruir la infraestructura
 
-```bash
-terraform destroy
-```
+`terraform destroy` falla mientras el EFS tenga `prevent_destroy`. Para
+destruir de forma consciente:
 
-> El volumen EFS de Postgres se elimina con `terraform destroy` salvo que
-> se haya configurado explícitamente lo contrario — exporta los datos con
-> `scripts/export_postgres.sh` antes de destruir si necesitas conservarlos.
+1. Exportar Postgres con `scripts/export_postgres.sh` y comprobar el dump.
+2. En un cambio revisado, quitar temporalmente `prevent_destroy` de `efs.tf`.
+3. Vaciar los repositorios ECR. Alternativa: poner `force_delete = true` y
+   ejecutar primero un `apply` (el borrado usa el valor guardado en el state, no
+   el de la configuración), aceptando que se borren las imágenes; se
+   reconstruyen con `scripts/push_images.sh`.
+4. `terraform plan -destroy`, revisar el plan y ejecutar `terraform destroy`,
+   confirmando en el prompt.
+5. Restaurar las protecciones antes del siguiente despliegue.

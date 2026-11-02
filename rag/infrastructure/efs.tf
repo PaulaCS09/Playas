@@ -5,6 +5,25 @@ resource "aws_efs_file_system" "postgres" {
   throughput_mode  = "bursting"
 
   tags = { Name = "${local.name_prefix}-postgres-efs" }
+
+  # Contiene los datos de Postgres: bloquea destroy y reemplazos accidentales.
+  # Para destruirlo de forma consciente, ver "Destruir la infraestructura" en
+  # rag/infrastructure/README.md.
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Copias automáticas de AWS Backup. Desactivado por defecto: no está comprobado
+# que AWS Academy Learner Lab permita AWS Backup con LabRole, y genera coste de
+# almacenamiento. El respaldo soportado es scripts/export_postgres.sh.
+resource "aws_efs_backup_policy" "postgres" {
+  count          = var.enable_efs_backup ? 1 : 0
+  file_system_id = aws_efs_file_system.postgres.id
+
+  backup_policy {
+    status = "ENABLED"
+  }
 }
 
 # Access point with UID/GID of the postgres user in alpine (999)
