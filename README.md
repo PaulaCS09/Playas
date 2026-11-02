@@ -140,6 +140,11 @@ Por defecto conserva la copia en el bucket S3; usar `--delete-remote` para
 borrarla tras la descarga. Requiere el Session Manager Plugin (mismo requisito
 que `deploy.sh`, usa `aws ecs execute-command`).
 
+El dump contiene datos personales: la copia local queda con permisos `600` y la
+URL prefirmada de subida caduca a los 10 minutos. Como se firma antes de
+`pg_dump`, una base muy grande puede hacer que la subida falle con HTTP 403; en
+ese caso el script se detiene sin dejar un dump local incompleto.
+
 ### Alternativa: desplegar desde una EC2 bastion
 
 Si no quieres instalar Terraform, Docker, AWS CLI, etc. localmente, `scripts/deploy_bastion_ec2.sh`

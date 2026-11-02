@@ -13,7 +13,12 @@
 # Archivos que actualiza:
 #   rag/.env                             — CHROMA_HOST y OLLAMA_BASE_URL
 #   rag/infrastructure/terraform.tfvars  — chroma_host y ollama_base_url
+#
+# Ambos archivos contienen secretos: quedan con permisos 600 y los valores
+# nunca se imprimen.
 set -euo pipefail
+# Todo archivo que cree este script (tfvars, state) nace legible solo por el dueño.
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VECTOR_INFRA_DIR="${SCRIPT_DIR}/.."
@@ -138,22 +143,23 @@ get_tfvars_value() {
 
 # auto_generate_secret <archivo> <clave> <valor_generado>
 # Escribe el secreto solo si el valor actual está vacío o es un placeholder
-# (empieza con "cambia-"). Devuelve el valor efectivo.
+# (empieza con "cambia-"). Nunca imprime el valor: solo informa si lo generó.
 auto_generate_secret() {
   local file="$1" key="$2" generated="$3"
   local current
   current=$(get_tfvars_value "${file}" "${key}")
   if [[ -z "${current}" || "${current}" == cambia-* ]]; then
     update_tfvars "${file}" "${key}" "${generated}"
-    echo "${generated}"
+    ok "${key}: generado"
   else
-    echo "${current}"
+    ok "${key}: ya configurado, se conserva"
   fi
 }
 
 # ── 4. Actualizar rag/.env ────────────────────────────────────────────────────
 if [[ -f "${RAG_ENV}" ]]; then
   log "Actualizando ${RAG_ENV}..."
+  chmod 600 "${RAG_ENV}"
   update_env "${RAG_ENV}" "CHROMA_HOST"     "${CHROMA_HOST_VAL}"
   update_env "${RAG_ENV}" "OLLAMA_BASE_URL" "${OLLAMA_URL_VAL}"
   ok ".env actualizado"
@@ -174,11 +180,14 @@ if [[ ! -f "${ECS_TFVARS}" ]]; then
     touch "${ECS_TFVARS}"
   fi
 fi
+# Un tfvars creado antes de este script (o por otra herramienta) puede ser
+# legible por otros usuarios: se fuerza 600 antes de escribir secretos.
+chmod 600 "${ECS_TFVARS}"
 
 log "Generando secretos automáticamente (solo si son placeholders)..."
-PG_PASSWORD=$(auto_generate_secret "${ECS_TFVARS}" "postgres_password" "$(openssl rand -hex 16)")
-JWT_SECRET=$(auto_generate_secret  "${ECS_TFVARS}" "jwt_secret_key"    "$(openssl rand -hex 32)")
-ok "Secretos configurados"
+auto_generate_secret "${ECS_TFVARS}" "postgres_password" "$(openssl rand -hex 16)"
+auto_generate_secret "${ECS_TFVARS}" "jwt_secret_key"    "$(openssl rand -hex 32)"
+ok "Secretos configurados en ${ECS_TFVARS} (permisos 600; los valores no se muestran)"
 
 log "Actualizando ${ECS_TFVARS}..."
 update_tfvars "${ECS_TFVARS}" "chroma_host"     "${CHROMA_HOST_VAL}"
@@ -243,8 +252,7 @@ echo -e "${bold}Despliegue completado${reset}"
 echo ""
 echo -e "  CHROMA_HOST       = ${CHROMA_HOST_VAL}"
 echo -e "  OLLAMA_BASE_URL   = ${OLLAMA_URL_VAL}"
-echo -e "  postgres_password = ${PG_PASSWORD}"
-echo -e "  jwt_secret_key    = ${JWT_SECRET}"
+echo -e "  postgres_password y jwt_secret_key: configurados en terraform.tfvars (no se muestran)"
 echo ""
 echo -e "  Archivos actualizados:"
 [[ -f "${RAG_ENV}"     ]] && echo -e "    • rag/.env"

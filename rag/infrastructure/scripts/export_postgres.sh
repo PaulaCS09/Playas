@@ -15,6 +15,11 @@
 #   4. Por defecto deja la copia en el bucket S3; usar --delete-remote para
 #      borrarla tras la descarga.
 #
+# El dump contiene datos personales (emails, hashes y conversaciones): la copia
+# local queda con permisos 600 y la URL prefirmada caduca a los 10 minutos.
+# La URL se firma antes de abrir ECS Exec y ejecutar pg_dump: si ambos pasos
+# tardan más de 10 minutos, la subida falla con HTTP 403 y el script se detiene.
+#
 # Uso:
 #   ./scripts/export_postgres.sh --bucket <nombre-bucket> [opciones]
 #
@@ -32,6 +37,8 @@
 #   - Session Manager Plugin instalado (requerido por ECS Exec)
 #   - `uv` con el workspace de rag/ sincronizado (usa su boto3 para prefirmar la URL)
 set -euo pipefail
+# El directorio y el dump locales se crean legibles solo por el dueño.
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RAG_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -98,7 +105,7 @@ PRESIGN_URL=$(cd "${RAG_DIR}" && uv run python3 -c "
 import boto3
 from botocore.config import Config
 s3 = boto3.client('s3', region_name='${REGION}', config=Config(signature_version='s3v4'))
-print(s3.generate_presigned_url('put_object', Params={'Bucket': '${BUCKET}', 'Key': '${KEY}'}, ExpiresIn=1800))
+print(s3.generate_presigned_url('put_object', Params={'Bucket': '${BUCKET}', 'Key': '${KEY}'}, ExpiresIn=600))
 ")
 
 # ── 3. pg_dump dentro del contenedor + subida vía curl (con fallback a wget) ──
@@ -137,6 +144,7 @@ LOCAL_FILE="${OUTPUT_DIR}/${KEY}"
 
 log "Descargando a ${LOCAL_FILE}..."
 aws s3 cp "s3://${BUCKET}/${KEY}" "${LOCAL_FILE}" --region "${REGION}"
+chmod 600 "${LOCAL_FILE}"
 ok "Descargado ($(du -h "${LOCAL_FILE}" | cut -f1))"
 
 # ── 5. Limpieza opcional del objeto remoto ────────────────────────────────────
