@@ -14,12 +14,20 @@
 #   - Key pair "vockey" ya creado en EC2 y el archivo vockey.pem disponible localmente
 #   - rag/.env con OPENAI_API_KEY configurada (se usa para el paso 2 del README)
 #
-# Uso:
-#   ./scripts/deploy_bastion_ec2.sh
+# Uso (desde una terminal interactiva):
+#   BASTION_SSH_CIDR=<ip-publica>/32 ./scripts/deploy_bastion_ec2.sh
+#
+# Variables obligatorias:
+#   BASTION_SSH_CIDR  IP pública autorizada para SSH, con máscara /32.
+#                     No se admite 0.0.0.0/0.
 #
 # Variables opcionales:
 #   KEY_FILE   Ruta al .pem (default: ~/vockey.pem)
 #   AWS_REGION Región AWS (default: us-east-1)
+#
+# Cada terraform apply se ejecuta por `ssh -t` y pide confirmación humana.
+# Si el bastion ya tiene ~/playas, no se borra: se respaldan los states y se
+# actualiza el clon con `git pull --ff-only`.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -37,22 +45,54 @@ REGION="${AWS_REGION:-us-east-1}"
 IAM_INSTANCE_PROFILE="LabInstanceProfile"
 REPO_URL="https://github.com/jpospinalo/playas.git"
 SSH_USER="ubuntu"
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -i "${KEY_FILE}")
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -i "${KEY_FILE}")
 
 # ── Colores / helpers ──────────────────────────────────────────────────────
 bold='\033[1m'; green='\033[0;32m'; yellow='\033[1;33m'; red='\033[0;31m'; reset='\033[0m'
 
 LOCAL_STEP=0
-LOCAL_TOTAL=8
+LOCAL_TOTAL=11
 step()  { LOCAL_STEP=$((LOCAL_STEP+1)); echo ""; echo -e "${bold}▶ [LOCAL ${LOCAL_STEP}/${LOCAL_TOTAL}] $*${reset}"; }
 ok()    { echo -e "${green}✓ $*${reset}"; }
 warn()  { echo -e "${yellow}⚠ $*${reset}"; }
 fail()  { echo -e "${red}✗ $*${reset}"; exit 1; }
 
+# announce_ssh_rule <sg_id>: describe la escritura en AWS antes de hacerla.
+announce_ssh_rule() {
+  echo -e "${bold}Se va a crear esta regla de entrada en AWS:${reset}"
+  echo "  Security group: $1"
+  echo "  IP autorizada:  ${BASTION_SSH_CIDR%/32}"
+  echo "  Regla:          tcp/22 desde ${BASTION_SSH_CIDR}"
+}
+
 # ── 1. Validar prerrequisitos locales ──────────────────────────────────────
 step "Validando prerrequisitos locales"
 
 command -v aws >/dev/null 2>&1 || fail "aws CLI no está instalado."
+
+# normalize_ssh_cidr <cidr>: imprime la IPv4 /32 normalizada (sin ceros a la
+# izquierda) o falla si no es una IPv4 /32 válida distinta de 0.0.0.0.
+normalize_ssh_cidr() {
+  local cidr="$1" octet
+  local -a octets normalized=()
+  [[ "${cidr}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/32$ ]] || return 1
+  IFS='.' read -r -a octets <<< "${cidr%/32}"
+  for octet in "${octets[@]}"; do
+    octet=$((10#${octet}))
+    (( octet <= 255 )) || return 1
+    normalized+=("${octet}")
+  done
+  [[ "${normalized[*]}" != "0 0 0 0" ]] || return 1
+  local IFS='.'
+  echo "${normalized[*]}/32"
+}
+
+BASTION_SSH_CIDR="${BASTION_SSH_CIDR:-}"
+[[ -n "${BASTION_SSH_CIDR}" ]] || fail "Define BASTION_SSH_CIDR con tu IP pública autorizada (formato a.b.c.d/32)."
+BASTION_SSH_CIDR="$(normalize_ssh_cidr "${BASTION_SSH_CIDR}")" \
+  || fail "BASTION_SSH_CIDR debe ser una IPv4 con máscara /32 (no se admite 0.0.0.0/0)."
+[[ -t 0 ]] || fail "Ejecuta este script desde una terminal interactiva: cada terraform apply pide confirmación."
 
 [[ -f "${KEY_FILE}" ]] || fail "No se encontró el key pair local en ${KEY_FILE} (usa KEY_FILE=/ruta/vockey.pem)."
 chmod 400 "${KEY_FILE}"
@@ -82,12 +122,46 @@ if [[ -z "${SG_ID}" || "${SG_ID}" == "None" ]]; then
     --description "SSH para bastion de despliegue de ${PROJECT}" \
     --vpc-id "${VPC_ID}" \
     --query 'GroupId' --output text --region "${REGION}")
+  announce_ssh_rule "${SG_ID}"
   aws ec2 authorize-security-group-ingress \
-    --group-id "${SG_ID}" --protocol tcp --port 22 --cidr 0.0.0.0/0 \
+    --group-id "${SG_ID}" --protocol tcp --port 22 --cidr "${BASTION_SSH_CIDR}" \
     --region "${REGION}" >/dev/null
-  ok "Security group creado: ${SG_ID}"
+  ok "Security group creado: ${SG_ID} (SSH solo desde ${BASTION_SSH_CIDR})"
 else
-  ok "Security group existente reutilizado: ${SG_ID}"
+  # Lista de permitidos: toda regla que alcance el puerto 22/tcp (protocolo -1 o
+  # un rango tcp que incluya el 22), IPv4 o IPv6, debe ser exactamente BASTION_SSH_CIDR.
+  SSH_RULES="SecurityGroups[0].IpPermissions[?IpProtocol=='-1' || (IpProtocol=='tcp' && FromPort<=\`22\` && ToPort>=\`22\`)]"
+  # Asignación directa: si aws falla, set -e detiene el script.
+  SSH_V4_RAW=$(aws ec2 describe-security-groups --group-ids "${SG_ID}" \
+    --query "${SSH_RULES}.IpRanges[].CidrIp" --output text --region "${REGION}")
+  SSH_V6_RAW=$(aws ec2 describe-security-groups --group-ids "${SG_ID}" \
+    --query "${SSH_RULES}.Ipv6Ranges[].CidrIpv6" --output text --region "${REGION}")
+  # La salida text puede ocupar varias líneas o columnas: se aplana a una lista.
+  read -r -a SSH_V4 <<< "$(tr '\n\t' '  ' <<< "${SSH_V4_RAW}")"
+  read -r -a SSH_V6 <<< "$(tr '\n\t' '  ' <<< "${SSH_V6_RAW}")"
+  UNEXPECTED=()
+  HAS_OPERATOR_CIDR=0
+  for cidr in "${SSH_V4[@]}" "${SSH_V6[@]}"; do
+    [[ -z "${cidr}" || "${cidr}" == "None" ]] && continue
+    if [[ "${cidr}" == "${BASTION_SSH_CIDR}" ]]; then
+      HAS_OPERATOR_CIDR=1
+    else
+      UNEXPECTED+=("${cidr}")
+    fi
+  done
+  if [[ ${#UNEXPECTED[@]} -gt 0 ]]; then
+    fail "El security group ${SG_ID} permite SSH desde orígenes no autorizados: ${UNEXPECTED[*]}.
+  Una persona debe revisar y revocar esas reglas antes de continuar, por ejemplo:
+    aws ec2 revoke-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 22 --cidr <cidr> --region ${REGION}"
+  fi
+  if [[ "${HAS_OPERATOR_CIDR}" -eq 0 ]]; then
+    announce_ssh_rule "${SG_ID}"
+    aws ec2 authorize-security-group-ingress \
+      --group-id "${SG_ID}" --protocol tcp --port 22 --cidr "${BASTION_SSH_CIDR}" \
+      --region "${REGION}" >/dev/null
+    ok "Regla SSH añadida al security group ${SG_ID}: ${BASTION_SSH_CIDR}"
+  fi
+  ok "Security group existente reutilizado: ${SG_ID} (SSH solo desde ${BASTION_SSH_CIDR})"
 fi
 
 # ── 3. AMI Ubuntu 24.04 ─────────────────────────────────────────────────────
@@ -153,6 +227,15 @@ printf '%s' "${OPENAI_API_KEY}" | ssh "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}
   'umask 077; cat > ~/.openai_api_key'
 ok "OPENAI_API_KEY transferida"
 
+# Si el script termina antes de volcar la clave en terraform.tfvars (p. ej., la
+# persona rechaza el primer apply), se borra la copia temporal del bastion.
+cleanup_remote_key() {
+  ssh "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" \
+    'shred -u ~/.openai_api_key 2>/dev/null || rm -f ~/.openai_api_key' >/dev/null 2>&1 \
+    || warn "No se pudo borrar ~/.openai_api_key del bastion; borrarla manualmente."
+}
+trap cleanup_remote_key EXIT
+
 ssh "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" 'mkdir -p ~/seed_data'
 
 LATEST_EXPORT="$(ls -t "${REPO_DIR}"/data/*.jsonl.gz 2>/dev/null | head -1 || true)"
@@ -168,17 +251,19 @@ if [[ -f "${REPO_DIR}/data/seed_users.sql" ]]; then
   ok "seed_users.sql copiado"
 fi
 
-# ── 7. Bootstrap remoto: instalar dependencias y desplegar ────────────────
+# ── 7. Bootstrap remoto: instalar dependencias y preparar el clon ─────────
+# Este bloque se envía por stdin y no ejecuta Terraform: un terraform apply
+# dentro del heredoc leería el resto del script como respuesta al prompt.
 BOOTSTRAP_ONLY="${BOOTSTRAP_ONLY:-0}"
-step "Ejecutando bootstrap y despliegue remoto en la EC2 (esto tarda varios minutos)"
+step "Ejecutando bootstrap remoto en la EC2 (esto tarda varios minutos)"
 
-ssh "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" "REPO_URL='${REPO_URL}' BOOTSTRAP_ONLY='${BOOTSTRAP_ONLY}' bash -s" <<'REMOTE_SCRIPT'
+ssh "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" "REPO_URL='${REPO_URL}' bash -s" <<'REMOTE_SCRIPT'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
 bold='\033[1m'; green='\033[0;32m'; reset='\033[0m'
-STEP=0; TOTAL=12
+STEP=0; TOTAL=8
 step() {
   STEP=$((STEP+1))
   echo ""
@@ -230,25 +315,65 @@ curl -fsSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubu
 sudo dpkg -i /tmp/session-manager-plugin.deb
 ok "session-manager-plugin instalado"
 
-step "Clonando el repositorio"
-rm -rf ~/playas
-git clone "${REPO_URL}" ~/playas
-cd ~/playas
-ok "Repositorio clonado en ~/playas ($(git rev-parse --short HEAD))"
+step "Preparando el repositorio en ~/playas (sin borrar states ni tfvars)"
+if [[ -e ~/playas ]]; then
+  [[ -d ~/playas/.git ]] || { echo "✗ ~/playas existe pero no es un repositorio Git; revisarlo manualmente." >&2; exit 1; }
+  # Los *.tfstate y *.tfvars están ignorados por Git: git pull no los toca.
+  # Aun así se respaldan fuera del clon antes de actualizar.
+  BACKUP_DIR="${HOME}/tfstate-backups/pre-pull-$(date +%Y%m%d-%H%M%S)"
+  (
+    umask 077
+    mkdir -p "${BACKUP_DIR}"
+    cd ~/playas
+    find . -path ./.git -prune -o -name 'terraform.tfstate*' \( -type f -o -type l \) -print \
+      | while IFS= read -r f; do
+          mkdir -p "${BACKUP_DIR}/$(dirname "${f}")"
+          cp -pL "${f}" "${BACKUP_DIR}/${f}"
+          chmod 600 "${BACKUP_DIR}/${f}"
+        done
+  )
+  ok "States existentes respaldados en ${BACKUP_DIR}"
+  BRANCH="$(git -C ~/playas rev-parse --abbrev-ref HEAD)"
+  if [[ "${BRANCH}" != "main" ]]; then
+    echo "✗ ~/playas está en '${BRANCH}', no en main. Revisarlo manualmente (git -C ~/playas switch main)." >&2
+    exit 1
+  fi
+  if [[ -n "$(git -C ~/playas status --porcelain --untracked-files=no)" ]]; then
+    echo "✗ ~/playas tiene cambios locales en archivos versionados:" >&2
+    git -C ~/playas status --short --untracked-files=no >&2
+    echo "  Revisarlos (p. ej., git -C ~/playas diff) y descartarlos o guardarlos manualmente antes de repetir." >&2
+    exit 1
+  fi
+  git -C ~/playas pull --ff-only
+  ok "Repositorio actualizado en ~/playas ($(git -C ~/playas rev-parse --short HEAD))"
+else
+  git clone "${REPO_URL}" ~/playas
+  ok "Repositorio clonado en ~/playas ($(git -C ~/playas rev-parse --short HEAD))"
+fi
 
-if [[ "${BOOTSTRAP_ONLY:-0}" == "1" ]]; then
+mkdir -p ~/playas/data
+[[ -d ~/seed_data ]] && cp -v ~/seed_data/* ~/playas/data/ 2>/dev/null || true
+ok "Bootstrap completado"
+REMOTE_SCRIPT
+
+if [[ "${BOOTSTRAP_ONLY}" == "1" ]]; then
   echo ""
-  echo -e "${bold}BOOTSTRAP_ONLY=1: deteniendo antes de los despliegues de Terraform (pasos 9-12).${reset}"
+  echo -e "${bold}BOOTSTRAP_ONLY=1: deteniendo antes de los despliegues de Terraform.${reset}"
   exit 0
 fi
 
-step "Desplegando infraestructura vectorial - README paso 1 (ChromaDB + Ollama)"
-mkdir -p ~/playas/data
-[[ -d ~/seed_data ]] && cp -v ~/seed_data/* ~/playas/data/ 2>/dev/null || true
-cd ~/playas
-./vector-infraestructura/scripts/deploy.sh --auto-approve
+# ── 8. Despliegues con confirmación humana (ssh -t asigna una terminal) ────
+REMOTE_PATH='export PATH="${HOME}/.local/bin:${PATH}"'
 
-step "Configurando OPENAI_API_KEY - README paso 2"
+step "Desplegando infraestructura vectorial - README paso 1 (ChromaDB + Ollama)"
+ssh -t "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" \
+  "${REMOTE_PATH}; cd ~/playas && ./vector-infraestructura/scripts/deploy.sh"
+
+step "Configurando OPENAI_API_KEY en el bastion - README paso 2"
+ssh "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" "bash -s" <<'REMOTE_SCRIPT'
+set -euo pipefail
+green='\033[0;32m'; reset='\033[0m'
+ok() { echo -e "${green}✓ $*${reset}"; }
 TFVARS="${HOME}/playas/rag/infrastructure/terraform.tfvars"
 KEY_VALUE="$(cat "${HOME}/.openai_api_key")"
 if grep -q '^openai_api_key' "${TFVARS}" 2>/dev/null; then
@@ -258,16 +383,17 @@ else
 fi
 shred -u "${HOME}/.openai_api_key" 2>/dev/null || rm -f "${HOME}/.openai_api_key"
 ok "openai_api_key configurada en terraform.tfvars"
+REMOTE_SCRIPT
+trap - EXIT
 
 step "Desplegando aplicación RAG en ECS Fargate - README paso 2"
-cd ~/playas
-sg docker -c "./rag/infrastructure/scripts/deploy.sh --auto-approve"
+ssh -t "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" \
+  "${REMOTE_PATH}; cd ~/playas && sg docker -c ./rag/infrastructure/scripts/deploy.sh"
 
-step "Despliegue completado"
-cd ~/playas/rag/infrastructure
-ALB_URL=$(terraform output -raw alb_url 2>/dev/null || echo "(ejecuta 'terraform output alb_url' manualmente)")
+ALB_URL=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" \
+  "terraform -chdir=\${HOME}/playas/rag/infrastructure output -raw alb_url" 2>/dev/null \
+  || echo "(ejecuta 'terraform output alb_url' manualmente)")
 ok "URL de la aplicación: ${ALB_URL}"
-REMOTE_SCRIPT
 
 echo ""
 step "Resumen"

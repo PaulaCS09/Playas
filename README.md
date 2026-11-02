@@ -76,8 +76,15 @@ session-manager-plugin   # debe responder "was installed successfully"
 El script crea las EC2 con IP estática, actualiza las variables de entorno del proyecto con las IPs resultantes e importa los datos en ChromaDB:
 
 ```bash
-./vector-infraestructura/scripts/deploy.sh --auto-approve
+./vector-infraestructura/scripts/deploy.sh
 ```
+
+Los scripts de despliegue requieren una terminal interactiva: `terraform apply`
+muestra el plan y espera confirmación humana (`--auto-approve` no está
+permitido, y el script se detiene si `TF_CLI_ARGS*` o `TF_INPUT` están
+definidas). Antes de cada apply copian el state local a `~/tfstate-backups/`
+(configurable con `TFSTATE_BACKUP_DIR`), fuera del clon, y dejan el state con
+permisos `600`.
 
 Al finalizar, `rag/.env` y `rag/infrastructure/terraform.tfvars` quedan actualizados con `CHROMA_HOST` y `OLLAMA_BASE_URL`.
 
@@ -95,8 +102,12 @@ google_api_key     = "..."   # Gemini (prioridad 3)
 Despliega la infraestructura ECS, construye las imágenes y las sube a ECR:
 
 ```bash
-./rag/infrastructure/scripts/deploy.sh --auto-approve
+./rag/infrastructure/scripts/deploy.sh
 ```
+
+Si un security group existe en AWS con un ID distinto al del state, el script
+se detiene sin modificar el state e indica los comandos `state rm`/`import`
+para que una persona los revise y ejecute manualmente.
 
 ### 3. Verificar
 
@@ -145,9 +156,18 @@ Requisitos:
 - Key pair `vockey` ya creado en EC2 (estándar en AWS Academy) y su `.pem` descargado localmente
 - `rag/.env` con `OPENAI_API_KEY` configurada (se transfiere a la EC2 por stdin, nunca queda
   expuesta en logs ni en el script)
+- `BASTION_SSH_CIDR` con la IP pública autorizada para SSH, con máscara `/32`. El script
+  rechaza `0.0.0.0/0`. Si reutiliza el security group del bastion, se detiene cuando alguna
+  regla que alcance el puerto 22/tcp (IPv4 o IPv6, protocolo `-1` o un rango de puertos)
+  admite un origen distinto de `BASTION_SSH_CIDR`, y muestra el comando `revoke` para que una
+  persona lo ejecute. Si falta la regla `/32`, muestra el security group, la IP y la regla
+  `tcp/22` que va a crear, y la añade.
+- Una terminal interactiva: cada `terraform apply` se ejecuta por `ssh -t` y pide confirmación.
+  Para que un corte de red no interrumpa un apply, conviene trabajar dentro de `tmux` en la
+  máquina local.
 
 ```bash
-KEY_FILE=/ruta/a/vockey.pem ./scripts/deploy_bastion_ec2.sh
+BASTION_SSH_CIDR=203.0.113.10/32 KEY_FILE=/ruta/a/vockey.pem ./scripts/deploy_bastion_ec2.sh
 ```
 
 La EC2 (`m4.large`, Ubuntu 24.04, 50GB, instance profile `LabInstanceProfile`) queda como bastion
@@ -158,17 +178,28 @@ Usa `BOOTSTRAP_ONLY=1` para solo aprovisionar la EC2 e instalar dependencias (gi
 Terraform, AWS CLI, uv, Session Manager Plugin) sin ejecutar los despliegues de Terraform:
 
 ```bash
-BOOTSTRAP_ONLY=1 KEY_FILE=/ruta/a/vockey.pem ./scripts/deploy_bastion_ec2.sh
+BOOTSTRAP_ONLY=1 BASTION_SSH_CIDR=203.0.113.10/32 KEY_FILE=/ruta/a/vockey.pem ./scripts/deploy_bastion_ec2.sh
 ```
 
 Si ya existe una instancia bastion (`rag-playas-bastion`) corriendo, el script la reutiliza en
 vez de crear una nueva.
 
-> Antes de repetir este despliegue, el responsable de infraestructura debe
-> resguardar los estados Terraform y las configuraciones locales del bastion.
-> El script actual elimina su checkout `~/playas` antes de clonar, también si
-> reutiliza la instancia. No usarlo para encendido/apagado diario ni asumir que
-> conserva esos archivos. `BOOTSTRAP_ONLY=1` tampoco evita esa eliminación.
+> Si el bastion ya tiene `~/playas`, el script no lo borra: copia los
+> `terraform.tfstate*` a `~/tfstate-backups/pre-pull-<fecha>/` y actualiza el
+> clon con `git pull --ff-only` (los states y tfvars están ignorados por Git).
+> Esas copias siguen dentro de la cuenta del Learner Lab: el responsable de
+> infraestructura debe resguardar los states fuera de AWS antes de repetir el
+> despliegue. No usar este script para encendido/apagado diario.
+>
+> El script se detiene sin actualizar el clon si `~/playas` no está en `main` o
+> tiene cambios en archivos versionados (por ejemplo, un `.terraform.lock.hcl`
+> reescrito por un `init -upgrade` antiguo o un `data/seed_users.sql` copiado
+> distinto del versionado). Revisarlos con `git -C ~/playas status` y
+> `git -C ~/playas diff`, y descartarlos o guardarlos manualmente antes de repetir.
+>
+> Si la ejecución termina antes de configurar la API key (por ejemplo, porque se
+> rechazó el primer apply), el script borra `~/.openai_api_key` del bastion; si no
+> lo consigue, lo indica para borrarlo manualmente.
 
 ---
 
