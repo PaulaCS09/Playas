@@ -323,7 +323,10 @@ terraform -chdir=rag/infrastructure destroy
 terraform -chdir=vector-infraestructura destroy
 ```
 
-> `terraform destroy` elimina también el EFS administrado por este stack,
-> salvo protección configurada explícitamente. Exportar PostgreSQL antes de
-> destruir. Destruir las EC2 elimina sus discos e índice: conservar también un
-> respaldo de ChromaDB. Para ahorrar cómputo sin destruir datos, usar `stop.sh`.
+> El EFS de PostgreSQL y las EC2 de ChromaDB/Ollama tienen `prevent_destroy`,
+> así que estos `destroy` fallan hasta que se retire esa protección en un cambio
+> revisado. Antes, exportar PostgreSQL y conservar un respaldo de ChromaDB:
+> destruir o reemplazar las EC2 elimina sus discos e índice. Ver los
+> procedimientos en [rag/infrastructure/README.md](rag/infrastructure/README.md)
+> y [vector-infraestructura/README.md](vector-infraestructura/README.md). Para
+> ahorrar cómputo sin destruir datos, usar `stop.sh`.

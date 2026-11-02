@@ -71,6 +71,20 @@ resource "aws_instance" "chromadb" {
   tags = {
     Name = "${var.project}-chromadb"
   }
+
+  # Protección de datos:
+  # - prevent_destroy bloquea cualquier plan que destruya o reemplace la
+  #   instancia y su disco raíz, donde vive /opt/chroma-data
+  #   (destroy, -replace o un cambio que fuerce reemplazo, como key_name).
+  # - ignore_changes evita que una AMI nueva de Canonical (most_recent) o un
+  #   cambio en el script de arranque fuercen el reemplazo. user_data solo se
+  #   ejecuta en el primer arranque; aplicarlo exige recrear la instancia.
+  # Para reemplazarla de forma consciente, ver "Reemplazar o destruir las EC2"
+  # en vector-infraestructura/README.md.
+  lifecycle {
+    prevent_destroy = true
+    ignore_changes  = [ami, user_data]
+  }
 }
 
 # ------------------------------------------------------------------------------
