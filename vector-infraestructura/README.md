@@ -90,6 +90,7 @@ Despliegue completado
 
   CHROMA_HOST     = 54.x.x.x
   OLLAMA_BASE_URL = http://3.x.x.x:11434
+  postgres_password y jwt_secret_key: configurados en terraform.tfvars (no se muestran)
 
   Archivos actualizados:
     • rag/.env
