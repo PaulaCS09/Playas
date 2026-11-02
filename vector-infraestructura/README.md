@@ -47,16 +47,16 @@ Desde la raíz del repositorio (`playas/`):
 ./vector-infraestructura/scripts/deploy.sh
 ```
 
-Con aprobación automática (sin confirmación interactiva de Terraform):
-
-```bash
-./vector-infraestructura/scripts/deploy.sh --auto-approve
-```
+El script requiere una terminal interactiva: `terraform apply` siempre pide
+confirmación humana y `--auto-approve` no está permitido. `terraform init` se
+ejecuta sin `-upgrade` para respetar `.terraform.lock.hcl`, y antes del apply el
+state local se copia a `~/tfstate-backups/` (configurable con `TFSTATE_BACKUP_DIR`).
 
 ### Qué hace el script
 
 ```
-1. terraform apply          — crea/actualiza las EC2 con sus Elastic IPs
+0. terraform init           — sin -upgrade; copia el state a ~/tfstate-backups/
+1. terraform apply          — crea/actualiza las EC2 con sus Elastic IPs (pide confirmación)
 2. terraform output         — lee las IPs estáticas resultantes
 3. Actualiza rag/.env       — CHROMA_HOST y OLLAMA_BASE_URL
 4. Actualiza rag/infrastructure/terraform.tfvars — chroma_host y ollama_base_url

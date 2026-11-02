@@ -4,7 +4,11 @@
 # Una vez que ChromaDB esté disponible, importa el archivo .jsonl.gz de data/.
 #
 # Uso:
-#   ./scripts/deploy.sh [--auto-approve]
+#   ./scripts/deploy.sh
+#
+# terraform apply siempre pide confirmación humana: el script exige una
+# terminal interactiva y rechaza --auto-approve. Antes del apply copia el
+# state local a TFSTATE_BACKUP_DIR (default: ~/tfstate-backups), fuera del clon.
 #
 # Archivos que actualiza:
 #   rag/.env                             — CHROMA_HOST y OLLAMA_BASE_URL
@@ -31,18 +35,64 @@ log()  { echo -e "${bold}▶ $*${reset}"; }
 ok()   { echo -e "${green}✓ $*${reset}"; }
 warn() { echo -e "${yellow}⚠ $*${reset}"; }
 
+# ── 0. Salvaguardas: confirmación humana y copia del state ────────────────────
+if [[ $# -gt 0 ]]; then
+  echo "✗ Argumento no admitido: $1. terraform apply requiere confirmación humana; --auto-approve no está permitido." >&2
+  exit 1
+fi
+if [[ ! -t 0 ]]; then
+  echo "✗ Se requiere una terminal interactiva para confirmar terraform apply (en SSH, usar ssh -t)." >&2
+  exit 1
+fi
+# Estas variables pueden inyectar -auto-approve, -upgrade o desactivar el prompt.
+for tf_var in TF_CLI_ARGS TF_CLI_ARGS_init TF_CLI_ARGS_plan TF_CLI_ARGS_apply TF_INPUT; do
+  if [[ -n "${!tf_var:-}" ]]; then
+    echo "✗ ${tf_var} está definida; puede omitir la confirmación de terraform apply. Ejecuta: unset ${tf_var}" >&2
+    exit 1
+  fi
+done
+
+# backup_state <directorio_terraform> <nombre_stack>
+# Copia el state local (si existe) fuera del clon, con permisos 600, y deja el
+# state original también en 600: contiene los valores de las variables sensibles.
+backup_state() {
+  local tf_dir="$1" stack="$2" dest
+  if [[ -e "${tf_dir}/.terraform.tfstate.lock.info" ]]; then
+    echo "✗ Existe ${tf_dir}/.terraform.tfstate.lock.info: otro proceso de Terraform puede estar en curso." >&2
+    exit 1
+  fi
+  if [[ ! -f "${tf_dir}/terraform.tfstate" ]]; then
+    warn "No hay terraform.tfstate local en ${stack}; no hay nada que respaldar"
+    return 0
+  fi
+  dest="${TFSTATE_BACKUP_DIR:-${HOME}/tfstate-backups}/${stack}/$(date +%Y%m%d-%H%M%S)-$$"
+  (
+    umask 077
+    mkdir -p "${dest}"
+    cp -pL "${tf_dir}"/terraform.tfstate* "${dest}/"
+    chmod 600 "${dest}"/terraform.tfstate* "${tf_dir}"/terraform.tfstate*
+  )
+  ok "State respaldado en ${dest}"
+}
+
+# restrict_state <directorio_terraform>: deja el state escrito por apply en 600.
+restrict_state() {
+  local tf_dir="$1"
+  if compgen -G "${tf_dir}/terraform.tfstate*" > /dev/null; then
+    chmod 600 "${tf_dir}"/terraform.tfstate*
+  fi
+}
+
 # ── 1. Terraform init + apply ─────────────────────────────────────────────────
 log "Inicializando Terraform en vector-infraestructura..."
-terraform -chdir="${VECTOR_INFRA_DIR}" init -upgrade
+# Sin -upgrade: respeta las versiones fijadas en .terraform.lock.hcl.
+terraform -chdir="${VECTOR_INFRA_DIR}" init
 
-log "Ejecutando terraform apply en vector-infraestructura..."
+backup_state "${VECTOR_INFRA_DIR}" "vector-infraestructura"
 
-APPLY_ARGS=()
-if [[ "${1:-}" == "--auto-approve" ]]; then
-  APPLY_ARGS+=("-auto-approve")
-fi
-
-terraform -chdir="${VECTOR_INFRA_DIR}" apply "${APPLY_ARGS[@]}"
+log "Ejecutando terraform apply en vector-infraestructura (requiere confirmación)..."
+terraform -chdir="${VECTOR_INFRA_DIR}" apply -input=true
+restrict_state "${VECTOR_INFRA_DIR}"
 
 # ── 2. Leer IPs estáticas del output ─────────────────────────────────────────
 log "Leyendo IPs estáticas desde Terraform outputs..."
@@ -207,5 +257,5 @@ echo -e "      openrouter_api_key = \"...\"   # prioridad 2"
 echo -e "      google_api_key     = \"...\"   # prioridad 3"
 echo ""
 echo -e "  Luego ejecuta:"
-echo -e "    ./rag/infrastructure/scripts/deploy.sh --auto-approve"
+echo -e "    ./rag/infrastructure/scripts/deploy.sh"
 echo -e "${bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${reset}"
