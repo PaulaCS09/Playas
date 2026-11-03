@@ -125,6 +125,9 @@ echo "terraform $*" >> "${CALL_LOG}"
 case "$*" in
   *" output -raw chromadb_public_ip"*) echo "10.0.0.1" ;;
   *" output -raw ollama_public_ip"*) echo "10.0.0.2" ;;
+  *" output -raw chromadb_private_ip"*) echo "172.31.1.1" ;;
+  *" output -raw ollama_private_ip"*) echo "172.31.1.2" ;;
+  *" output -raw vector_clients_security_group_id"*) echo "sg-0123456789abcdef0" ;;
 esac
 exit 0
 """,
@@ -175,6 +178,8 @@ def _run(script: Path, tmp_path: Path, *args: str) -> tuple[subprocess.Completed
         "HOME": str(home),
         "CALL_LOG": str(call_log),
         "TFSTATE_BACKUP_DIR": str(tmp_path / "backups"),
+        # A5: el deploy de vector exige fijar el acceso público transitorio.
+        "TF_VAR_legacy_public_service_access": "false",
     }
     master, slave = pty.openpty()
     try:
