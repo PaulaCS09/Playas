@@ -147,6 +147,19 @@ variable "query_enrichment_enabled" {
   default     = true
 }
 
+# ── Rate limiting y proxy ─────────────────────────────────────────────────────
+
+variable "auth_rate_limit_mode" {
+  description = "Modo del límite de intentos de login: off, observe (solo registra) o enforce (responde 429). Pasar a enforce solo tras validar en observe que se registra la IP real del cliente."
+  type        = string
+  default     = "observe"
+
+  validation {
+    condition     = contains(["off", "observe", "enforce"], var.auth_rate_limit_mode)
+    error_message = "auth_rate_limit_mode debe ser off, observe o enforce."
+  }
+}
+
 # ── EFS ───────────────────────────────────────────────────────────────────────
 
 variable "enable_efs_backup" {

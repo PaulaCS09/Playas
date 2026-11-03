@@ -91,13 +91,15 @@ class UserResponse(BaseModel):
 
 
 def _login_rate_limit_key(email: str, request: Request) -> str:
-    """Clave del límite de login: email normalizado + IP de origen, con hash
+    """Clave del límite de login: email normalizado + IP del cliente, con hash
     para no conservar direcciones IP ni correos en claro en memoria.
 
-    request.client.host es la IP de la conexión TCP directa. No se confía en
-    cabeceras como X-Forwarded-For: sin una política de proxy de confianza
-    explícita, serían falsificables por el cliente y permitirían evadir el
-    límite trivialmente.
+    request.client.host es la IP que deja ProxyHeadersMiddleware de uvicorn:
+    la IP real del cliente cuando la conexión llega desde un proxy listado en
+    FORWARDED_ALLOW_IPS (el ALB, vía X-Forwarded-For), o la IP de la conexión
+    TCP directa en cualquier otro caso. Este código no lee X-Forwarded-For por
+    su cuenta: hacerlo sin esa política permitiría falsificar la IP y evadir el
+    límite.
     """
     raw = f"{email}:{request.client.host if request.client else ''}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -122,8 +124,14 @@ async def _opportunistically_rehash(user: User, password: str, session: AsyncSes
     try:
         user.password_hash = await hash_password_async(password)
         await session.commit()
-    except Exception:
-        logger.warning("opportunistic_password_rehash_failed user_id=%s", user_id, exc_info=True)
+    except Exception as exc:
+        # Solo el tipo de error, sin traceback: el mensaje de SQLAlchemy puede
+        # incluir los parámetros de la consulta (el nuevo password_hash).
+        logger.warning(
+            "opportunistic_password_rehash_failed user_id=%s error_type=%s",
+            user_id,
+            type(exc).__name__,
+        )
         await session.rollback()
 
 

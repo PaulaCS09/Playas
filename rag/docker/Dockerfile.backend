@@ -34,4 +34,6 @@ USER appuser
 
 EXPOSE 8080
 
-CMD ["uvicorn", "rag.api.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+# --proxy-headers explícito: uvicorn solo acepta X-Forwarded-For de las IPs de
+# FORWARDED_ALLOW_IPS (definida por el despliegue; 127.0.0.1 si falta).
+CMD ["uvicorn", "rag.api.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--proxy-headers"]

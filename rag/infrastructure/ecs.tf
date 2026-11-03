@@ -124,7 +124,13 @@ resource "aws_ecs_task_definition" "app" {
         { name = "OLLAMA_EMBEDDING_MODEL",   value = var.ollama_embedding_model },
         { name = "OLLAMA_RERANKER_MODEL",    value = var.ollama_reranker_model },
         { name = "QUERY_ENRICHMENT_ENABLED", value = tostring(var.query_enrichment_enabled) },
-        { name = "S3_BUCKET_NAME",           value = var.s3_bucket_name }
+        { name = "S3_BUCKET_NAME",           value = var.s3_bucket_name },
+        # Solo se confía en X-Forwarded-For de conexiones desde los CIDR de la
+        # VPC (primario y secundarios), donde están los nodos del ALB; el SG de
+        # la app solo admite el puerto 8080 desde el SG del ALB.
+        # Nunca "*": permitiría falsificar la IP del cliente.
+        { name = "FORWARDED_ALLOW_IPS",      value = join(",", [for assoc in data.aws_vpc.default.cidr_block_associations : assoc.cidr_block]) },
+        { name = "AUTH_RATE_LIMIT_MODE",     value = var.auth_rate_limit_mode }
       ]
 
       dependsOn = [{
