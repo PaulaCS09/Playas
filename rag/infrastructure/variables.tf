@@ -104,7 +104,7 @@ variable "gemini_model" {
 # ── ChromaDB ──────────────────────────────────────────────────────────────────
 
 variable "chroma_host" {
-  description = "Host del servidor ChromaDB"
+  description = "Host del servidor ChromaDB. En ECS, la IP privada (output chromadb_private_ip de vector-infraestructura)"
   type        = string
 }
 
@@ -123,7 +123,7 @@ variable "chroma_collection" {
 # ── Ollama ────────────────────────────────────────────────────────────────────
 
 variable "ollama_base_url" {
-  description = "URL base del servidor Ollama"
+  description = "URL base del servidor Ollama. En ECS, http://<IP privada>:11434 (output ollama_private_ip)"
   type        = string
 }
 
@@ -174,4 +174,17 @@ variable "s3_bucket_name" {
   description = "Nombre del bucket S3 del pipeline de datos"
   type        = string
   default     = ""
+}
+
+# ── Red: acceso a ChromaDB/Ollama ─────────────────────────────────────────────
+
+variable "vector_clients_security_group_id" {
+  description = "SG vector_clients de vector-infraestructura (output vector_clients_security_group_id). Se adjunta a las tareas del backend para llegar a ChromaDB/Ollama por IP privada. Vacío: no se adjunta."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.vector_clients_security_group_id == "" || startswith(var.vector_clients_security_group_id, "sg-")
+    error_message = "vector_clients_security_group_id debe estar vacío o ser un ID de security group (sg-...)."
+  }
 }

@@ -114,6 +114,8 @@ def _run(
         "HOME": str(home),
         "CALL_LOG": str(call_log),
         "TFSTATE_BACKUP_DIR": str(tmp_path / "backups"),
+        # A5: el deploy de vector exige fijar el acceso público transitorio.
+        "TF_VAR_legacy_public_service_access": "false",
         **(env_extra or {}),
     }
     stdin_master: int | None = None

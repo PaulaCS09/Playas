@@ -11,8 +11,10 @@
 # state local a TFSTATE_BACKUP_DIR (default: ~/tfstate-backups), fuera del clon.
 #
 # Archivos que actualiza:
-#   rag/.env                             — CHROMA_HOST y OLLAMA_BASE_URL
-#   rag/infrastructure/terraform.tfvars  — chroma_host y ollama_base_url
+#   rag/.env                             — CHROMA_HOST y OLLAMA_BASE_URL (IP pública,
+#                                          para el operador)
+#   rag/infrastructure/terraform.tfvars  — chroma_host y ollama_base_url (IP privada,
+#                                          para ECS) y vector_clients_security_group_id
 #
 # Ambos archivos contienen secretos: quedan con permisos 600 y los valores
 # nunca se imprimen.
@@ -88,6 +90,18 @@ restrict_state() {
   fi
 }
 
+# Sin valor por defecto: el acceso público transitorio a ChromaDB/Ollama debe
+# decidirse de forma explícita, para que un clon sin terraform.tfvars no reabra
+# 8000/11434 tras la fase 3 de la migración de red.
+VECTOR_TFVARS="${VECTOR_INFRA_DIR}/terraform.tfvars"
+if [[ -z "${TF_VAR_legacy_public_service_access:-}" ]] \
+  && ! grep -qE '^[[:space:]]*legacy_public_service_access[[:space:]]*=' "${VECTOR_TFVARS}" 2>/dev/null; then
+  echo "✗ Falta legacy_public_service_access en ${VECTOR_TFVARS}." >&2
+  echo "  false si la migración de red ya terminó (fase 3); true solo durante las fases 1-2." >&2
+  echo "  Ver terraform.tfvars.example y 'Migración sin cortes' en vector-infraestructura/README.md." >&2
+  exit 1
+fi
+
 # ── 1. Terraform init + apply ─────────────────────────────────────────────────
 log "Inicializando Terraform en vector-infraestructura..."
 # Sin -upgrade: respeta las versiones fijadas en .terraform.lock.hcl.
@@ -104,12 +118,37 @@ log "Leyendo IPs estáticas desde Terraform outputs..."
 
 CHROMA_IP=$(terraform -chdir="${VECTOR_INFRA_DIR}" output -raw chromadb_public_ip)
 OLLAMA_IP=$(terraform -chdir="${VECTOR_INFRA_DIR}" output -raw ollama_public_ip)
+CHROMA_PRIVATE_IP=$(terraform -chdir="${VECTOR_INFRA_DIR}" output -raw chromadb_private_ip)
+OLLAMA_PRIVATE_IP=$(terraform -chdir="${VECTOR_INFRA_DIR}" output -raw ollama_private_ip)
+VECTOR_CLIENTS_SG=$(terraform -chdir="${VECTOR_INFRA_DIR}" output -raw vector_clients_security_group_id)
 
-ok "ChromaDB IP: ${CHROMA_IP}"
-ok "Ollama IP:   ${OLLAMA_IP}"
+for required in CHROMA_IP OLLAMA_IP CHROMA_PRIVATE_IP OLLAMA_PRIVATE_IP VECTOR_CLIENTS_SG; do
+  if [[ -z "${!required}" ]]; then
+    echo "✗ El output de Terraform para ${required} está vacío; revisar el apply de vector-infraestructura." >&2
+    exit 1
+  fi
+done
 
+ok "ChromaDB IP: ${CHROMA_IP} (privada ${CHROMA_PRIVATE_IP})"
+ok "Ollama IP:   ${OLLAMA_IP} (privada ${OLLAMA_PRIVATE_IP})"
+ok "SG de clientes: ${VECTOR_CLIENTS_SG}"
+
+LEGACY_PUBLIC=$(terraform -chdir="${VECTOR_INFRA_DIR}" output -raw legacy_public_service_access)
+OPERATOR_CIDRS=$(terraform -chdir="${VECTOR_INFRA_DIR}" output -raw operator_cidr_blocks_count)
+if [[ "${LEGACY_PUBLIC}" == "true" ]]; then
+  warn "ChromaDB (8000) y Ollama (11434) siguen abiertos a 0.0.0.0/0 (legacy_public_service_access = true)."
+  warn "Tras desplegar RAG y comprobar la app, poner legacy_public_service_access = false (fase 3, ver README)."
+fi
+if [[ "${OPERATOR_CIDRS}" == "0" && "${LEGACY_PUBLIC}" != "true" ]]; then
+  warn "operator_cidr_blocks está vacío: el heartbeat y la importación por IP pública fallarán desde aquí."
+fi
+
+# Operador (rag/.env, heartbeat, importación): IP pública, accesible desde
+# operator_cidr_blocks. ECS: IP privada, accesible desde el SG vector_clients.
 CHROMA_HOST_VAL="${CHROMA_IP}"
 OLLAMA_URL_VAL="http://${OLLAMA_IP}:11434"
+ECS_CHROMA_HOST="${CHROMA_PRIVATE_IP}"
+ECS_OLLAMA_URL="http://${OLLAMA_PRIVATE_IP}:11434"
 
 # ── 3. Helper: actualiza o agrega una variable ────────────────────────────────
 # update_env <archivo> <clave> <valor>
@@ -190,8 +229,9 @@ auto_generate_secret "${ECS_TFVARS}" "jwt_secret_key"    "$(openssl rand -hex 32
 ok "Secretos configurados en ${ECS_TFVARS} (permisos 600; los valores no se muestran)"
 
 log "Actualizando ${ECS_TFVARS}..."
-update_tfvars "${ECS_TFVARS}" "chroma_host"     "${CHROMA_HOST_VAL}"
-update_tfvars "${ECS_TFVARS}" "ollama_base_url" "${OLLAMA_URL_VAL}"
+update_tfvars "${ECS_TFVARS}" "chroma_host"     "${ECS_CHROMA_HOST}"
+update_tfvars "${ECS_TFVARS}" "ollama_base_url" "${ECS_OLLAMA_URL}"
+update_tfvars "${ECS_TFVARS}" "vector_clients_security_group_id" "${VECTOR_CLIENTS_SG}"
 ok "terraform.tfvars actualizado"
 
 # ── 6. Esperar a que ChromaDB esté disponible ─────────────────────────────────
@@ -250,8 +290,9 @@ echo ""
 echo -e "${bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${reset}"
 echo -e "${bold}Despliegue completado${reset}"
 echo ""
-echo -e "  CHROMA_HOST       = ${CHROMA_HOST_VAL}"
-echo -e "  OLLAMA_BASE_URL   = ${OLLAMA_URL_VAL}"
+echo -e "  CHROMA_HOST       = ${CHROMA_HOST_VAL} (rag/.env, operador)"
+echo -e "  OLLAMA_BASE_URL   = ${OLLAMA_URL_VAL} (rag/.env, operador)"
+echo -e "  ECS: chroma_host = ${ECS_CHROMA_HOST}, ollama_base_url = ${ECS_OLLAMA_URL} (IP privada)"
 echo -e "  postgres_password y jwt_secret_key: configurados en terraform.tfvars (no se muestran)"
 echo ""
 echo -e "  Archivos actualizados:"
