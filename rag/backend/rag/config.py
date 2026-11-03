@@ -41,6 +41,7 @@ comportamiento histórico de python-dotenv cuando no encuentra nada; las
 variables ya presentes en el proceso (Docker, ECS, CI) siguen funcionando.
 """
 
+import ipaddress
 import os
 from pathlib import Path
 from typing import Literal, cast
@@ -236,12 +237,52 @@ TITLE_RATE_LIMIT_MODE: RateLimitMode = _parse_mode("TITLE_RATE_LIMIT_MODE")
 TITLE_RATE_LIMIT_REQUESTS: int = int(os.getenv("TITLE_RATE_LIMIT_REQUESTS", "5"))
 TITLE_RATE_LIMIT_WINDOW_SECONDS: float = float(os.getenv("TITLE_RATE_LIMIT_WINDOW_SECONDS", "60"))
 
+# ── Proxy de confianza (X-Forwarded-For) ─────────────────────────────────────
+# uvicorn aplica ProxyHeadersMiddleware por defecto y solo acepta
+# X-Forwarded-For de las IPs/CIDR de FORWARDED_ALLOW_IPS (si no está definida,
+# solo 127.0.0.1). Con un CIDR de confianza toma la IP más a la derecha que no
+# sea de confianza, que el ALB añade y el cliente no puede falsificar. Con "*"
+# tomaría la más a la izquierda, controlada por el cliente. Se rechaza al
+# arrancar "*" y cualquier IP o red enrutable públicamente (0.0.0.0/0,
+# 0.0.0.0/1, 8.8.8.8, etc.): solo un proxy dentro de una red no pública (RFC
+# 1918, 100.64.0.0/10, loopback) puede ser de confianza.
+# La variable debe venir del entorno del proceso (uvicorn la lee antes de que
+# la app cargue .env) y no pasarse con --forwarded-allow-ips.
+
+
+def _parse_forwarded_allow_ips(env_var: str = "FORWARDED_ALLOW_IPS") -> str:
+    raw = os.getenv(env_var)
+    if raw is None:
+        return "127.0.0.1"
+    unsafe: list[str] = []
+    for entry in (item.strip() for item in raw.split(",")):
+        if entry == "*":
+            unsafe.append(entry)
+            continue
+        try:
+            network = ipaddress.ip_network(entry, strict=False)
+        except ValueError:
+            continue  # literal que uvicorn compara tal cual (p. ej. un socket)
+        if network.is_global:
+            unsafe.append(entry)
+    if unsafe:
+        raise ValueError(
+            f"{env_var} no puede incluir {unsafe}: permitiría falsificar la IP del "
+            "cliente con X-Forwarded-For. Usar solo IPs o CIDR no públicos del "
+            "proxy de confianza (p. ej. los de la VPC del ALB)."
+        )
+    return raw
+
+
+FORWARDED_ALLOW_IPS: str = _parse_forwarded_allow_ips()
+
 # ── Protección de login ──────────────────────────────────────────────────────
 # Límite reversible sobre /api/auth/login, independiente de los anteriores.
-# La clave combina el email normalizado y la IP de origen (ver routes/auth.py);
-# request.client.host no considera un proxy de confianza (no hay política de
-# X-Forwarded-For configurada), así que enforce no debe activarse en entornos
-# detrás de un proxy/LB sin revisar esa política primero. off por defecto.
+# La clave combina el email normalizado y la IP del cliente (ver
+# routes/auth.py). Detrás del ALB, esa IP solo es la real si FORWARDED_ALLOW_IPS
+# contiene el CIDR de la VPC; si no, todas las peticiones llegan con la IP del
+# ALB y enforce permitiría bloquear una cuenta a propósito conociendo su email.
+# off por defecto en local; el despliegue ECS lo fija con auth_rate_limit_mode.
 AUTH_RATE_LIMIT_MODE: RateLimitMode = _parse_mode("AUTH_RATE_LIMIT_MODE")
 AUTH_RATE_LIMIT_REQUESTS: int = int(os.getenv("AUTH_RATE_LIMIT_REQUESTS", "10"))
 AUTH_RATE_LIMIT_WINDOW_SECONDS: float = float(os.getenv("AUTH_RATE_LIMIT_WINDOW_SECONDS", "300"))

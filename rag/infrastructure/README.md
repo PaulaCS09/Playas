@@ -169,6 +169,81 @@ el script respalda el state, se detiene sin modificarlo e imprime los comandos
 3. Ejecutar manualmente los comandos impresos.
 4. Volver a lanzar `./scripts/deploy.sh` y revisar el plan antes de confirmar.
 
+## Límite de intentos de login y proxy de confianza
+
+El backend limita `POST /api/auth/login` por **email + IP real del cliente**
+(10 intentos en 300 s por defecto; `AUTH_RATE_LIMIT_REQUESTS` y
+`AUTH_RATE_LIMIT_WINDOW_SECONDS`).
+
+- **IP real detrás del ALB.** uvicorn se arranca con `--proxy-headers` y la
+  tarea recibe `FORWARDED_ALLOW_IPS` con todos los CIDR de la VPC por defecto
+  (primario y secundarios). uvicorn solo acepta `X-Forwarded-For` de conexiones
+  desde esos rangos (los nodos del ALB)
+  y toma la IP más a la derecha que no sea de confianza, que el ALB añade y el
+  cliente no puede falsificar. El SG de la app solo admite el puerto 8080 desde
+  el SG del ALB. **Nunca usar `FORWARDED_ALLOW_IPS=*`**: uvicorn tomaría la IP
+  más a la izquierda, controlada por el cliente. El backend se niega a arrancar
+  con `*` o con cualquier IP/red enrutable públicamente (`0.0.0.0/0`,
+  `0.0.0.0/1`, `8.8.8.8`, etc.).
+  La variable debe venir del entorno del proceso, no de `.env` ni del flag
+  `--forwarded-allow-ips` de uvicorn, que el backend no puede validar.
+- **Modo.** La variable `auth_rate_limit_mode` (por defecto `observe`) fija
+  `AUTH_RATE_LIMIT_MODE`: `observe` registra los excesos (`scope=login`, sin
+  email ni IP) sin bloquear; `enforce` responde 429 con `Retry-After`.
+
+Para pasar a `enforce`, en un despliegue revisado:
+
+1. Desplegar en `observe` y comprobar con
+   `aws logs tail /ecs/<cluster>-app --log-stream-name-prefix backend --filter-pattern '"POST /api/auth/login"'`
+   que las líneas de acceso de uvicorn muestran IPs públicas de clientes y no
+   IPs de la VPC. Las líneas de `/api/health` muestran siempre la IP privada del
+   ALB: es lo esperado.
+2. Enviar un login con dos cabeceras `X-Forwarded-For` falsas y comprobar que
+   la línea de acceso sigue mostrando la IP real del cliente. Revisar los
+   eventos `scope=login` durante el periodo de observación.
+3. Cambiar `auth_rate_limit_mode = "enforce"` en `terraform.tfvars`, revisar el
+   plan (solo cambia la task definition) y desplegar.
+4. Comprobar que el intento N+1 desde un mismo cliente devuelve 429 y que el
+   mismo email desde otra IP sigue respondiendo 401/200.
+
+Limitaciones:
+
+- El contador vive en memoria de cada tarea: se reinicia en cada despliegue y,
+  con N tareas, el límite efectivo es N × el configurado.
+- Se confía en todo el CIDR de la VPC, no solo en el ALB: otra máquina de la
+  VPC que llegara al puerto 8080 podría fijar la IP. Hoy lo impide el SG de la
+  app; no abrir ese puerto a otros orígenes.
+- Depende de que el ALB añada la IP del cliente. `alb.tf` no fija
+  `xff_header_processing_mode`, así que aplica el valor por defecto de AWS
+  (`append`); cambiarlo a `preserve` o `remove` invalida esta configuración.
+- La clave es email + IP: varios usuarios tras la misma IP (NAT, red
+  corporativa) no se bloquean entre sí, pero no hay límite solo por IP (un
+  cliente puede probar una contraseña contra muchos emails) ni solo por email
+  (un atacante que rote IPs no queda limitado para una misma cuenta).
+- En local, `FORWARDED_ALLOW_IPS` debe estar en el entorno del proceso (uvicorn
+  la lee antes de cargar `.env`). Sin ella, detrás del Nginx de
+  `docker-compose` la clave usa la IP del contenedor Nginx.
+
+### Registro de la IP real en CloudWatch
+
+Durante la validación en `observe` está autorizado registrar la IP real del
+cliente, que es un dato personal, con estas condiciones:
+
+- **Retención máxima de 14 días**: los log groups `/ecs/<cluster>-app` y
+  `-frontend` tienen `retention_in_days = 14`. No aumentarla.
+- **Acceso restringido**: en AWS Academy no se pueden crear políticas IAM
+  propias (todo usa `LabRole`), así que la restricción es organizativa: solo
+  las personas responsables de la operación acceden a la cuenta del lab y a
+  esos logs. No exportarlos fuera de la cuenta.
+- **Qué se registra**: la línea de acceso de uvicorn contiene solo
+  `IP:puerto`, método, ruta, versión HTTP y código de estado. No incluye
+  cabeceras (`Authorization`, JWT), cuerpos (contraseñas) ni la cadena
+  `X-Forwarded-For` completa: solo la IP ya resuelta. Ningún endpoint lleva
+  tokens en la query string, y la aplicación no registra cabeceras ni cuerpos.
+  `test_login_proxy_rate_limit.py` lo comprueba con un uvicorn real.
+- Si se deja de aceptar, arrancar uvicorn con `--no-access-log` (se pierde la
+  verificación del paso 1).
+
 ## Protección de datos
 
 - `aws_efs_file_system.postgres` tiene `prevent_destroy = true`: cualquier plan

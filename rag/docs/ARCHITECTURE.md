@@ -28,7 +28,7 @@ backend/rag/
     ├── main.py                 # App FastAPI: lifespan (compila grafo + init_db), health, ready, query, query/stream
     ├── query_support.py         # Helpers de main.py: fuentes, contexto, config del grafo, hidratación de historial
     ├── conversation_lock.py     # Registro de locks por conversación (evita turnos concurrentes en el mismo thread_id)
-    ├── rate_limit.py             # Rate limiting (query, generate-title, login) + backpressure de concurrencia global
+    ├── rate_limit.py             # Rate limiting (query, generate-title, login por email + IP real vía FORWARDED_ALLOW_IPS) + backpressure de concurrencia global
     ├── passwords.py              # Hash y verificación de contraseñas (SHA-256 + bcrypt)
     ├── auth.py                  # Dependencias JWT: get_optional_user / get_current_user / require_admin
     ├── database.py              # Motor/sesión async SQLAlchemy (Postgres en prod, SQLite de respaldo)
