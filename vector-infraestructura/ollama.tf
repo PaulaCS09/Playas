@@ -6,19 +6,48 @@ resource "aws_security_group" "ollama" {
   description = "Permite SSH y trafico Ollama (puerto 11434)"
 
   ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    description     = "Ollama API desde clientes autorizados (IP privada)"
+    from_port       = 11434
+    to_port         = 11434
+    protocol        = "tcp"
+    security_groups = [aws_security_group.vector_clients.id]
   }
 
-  ingress {
-    description = "Ollama API"
-    from_port   = 11434
-    to_port     = 11434
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+  dynamic "ingress" {
+    for_each = length(var.operator_cidr_blocks) > 0 ? [1] : []
+    content {
+      description = "Ollama API desde operador/bastion"
+      from_port   = 11434
+      to_port     = 11434
+      protocol    = "tcp"
+      cidr_blocks = var.operator_cidr_blocks
+    }
+  }
+
+  # Transitorio (fases 1-2 de la migración): retirar con
+  # legacy_public_service_access = false. Conserva exactamente la descripción
+  # y los atributos de la regla original para que el apply de la fase 1 no la
+  # revoque y vuelva a autorizar (corte breve del backend).
+  dynamic "ingress" {
+    for_each = var.legacy_public_service_access ? [1] : []
+    content {
+      description = "Ollama API"
+      from_port   = 11434
+      to_port     = 11434
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  }
+
+  dynamic "ingress" {
+    for_each = length(var.ssh_cidr_blocks) > 0 ? [1] : []
+    content {
+      description = "SSH desde CIDR autorizados"
+      from_port   = 22
+      to_port     = 22
+      protocol    = "tcp"
+      cidr_blocks = var.ssh_cidr_blocks
+    }
   }
 
   egress {

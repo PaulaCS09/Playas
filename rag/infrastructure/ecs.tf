@@ -198,8 +198,12 @@ resource "aws_ecs_service" "app" {
   deployment_maximum_percent         = 100
 
   network_configuration {
-    subnets          = data.aws_subnets.default.ids
-    security_groups  = [aws_security_group.app.id]
+    subnets = data.aws_subnets.default.ids
+    # vector_clients permite llegar a ChromaDB/Ollama por IP privada.
+    security_groups = concat(
+      [aws_security_group.app.id],
+      var.vector_clients_security_group_id == "" ? [] : [data.aws_security_group.vector_clients[0].id],
+    )
     assign_public_ip = true
   }
 

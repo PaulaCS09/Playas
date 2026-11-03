@@ -221,10 +221,81 @@ Hacerlo solo de forma consciente y revisada:
 | `project` | `rag-playas` | Prefijo usado en nombres y tags |
 | `environment` | `prod` | Entorno (`dev`, `staging`, `prod`) |
 | `key_pair_name` | `vockey` | Key pair EC2 para acceso SSH |
+| `operator_cidr_blocks` | `[]` | IPs públicas `/32` del operador o del bastion con acceso a 8000/11434 por la IP pública |
+| `ssh_cidr_blocks` | `[]` | IPs públicas `/32` con SSH a las EC2. Vacío: SSH cerrado |
+| `legacy_public_service_access` | — (obligatoria) | `true` solo en las fases 1-2 de la migración de red (8000/11434 abiertos a `0.0.0.0/0`); `false` desde la fase 3 y para siempre. `deploy.sh` se detiene si no está fijada |
 
-Para sobreescribir alguna variable crea un archivo `terraform.tfvars` en este directorio:
+Para sobreescribir alguna variable crea un archivo `terraform.tfvars` en este
+directorio (ver `terraform.tfvars.example`; no se versiona):
 
 ```hcl
-key_pair_name = "mi-key-pair"
-environment   = "dev"
+operator_cidr_blocks = ["203.0.113.10/32"]
+ssh_cidr_blocks      = ["203.0.113.10/32"]
+```
+
+## Seguridad de red
+
+ChromaDB (8000) y Ollama (11434) no tienen autenticación, así que su acceso se
+limita por security group:
+
+| Origen | Puertos | Regla |
+|---|---|---|
+| Tareas ECS del backend | 8000, 11434 | SG `vector_clients` (`network.tf`), por **IP privada** |
+| Operador / bastion | 8000, 11434 | `operator_cidr_blocks` (`/32`), por IP pública |
+| SSH | 22 | `ssh_cidr_blocks` (`/32`); sin valor, cerrado |
+| Cualquiera (transitorio) | 8000, 11434 | Solo con `legacy_public_service_access = true` (fases 1-2) |
+
+Las variables de CIDR rechazan `0.0.0.0/0` y cualquier máscara distinta de `/32`.
+Una regla por SG solo coincide con tráfico por IP privada: por eso
+`scripts/deploy.sh` escribe en `rag/infrastructure/terraform.tfvars` las IP
+privadas (`chroma_host`, `ollama_base_url`) y `vector_clients_security_group_id`,
+y deja la IP pública en `rag/.env` para el operador.
+
+Quién necesita `operator_cidr_blocks`: el heartbeat y la importación de
+`scripts/deploy.sh`, `rag/infrastructure/scripts/start.sh` y los comandos de
+`data/import_to_chromadb.py` o `rag/utils/chroma_*.py` lanzados desde fuera de
+la VPC. Si se despliega desde el bastion, incluir su IP pública (cambia al
+detenerlo y arrancarlo: actualizarla).
+
+### Migración sin cortes (tres fases)
+
+1. **Vector**: crear `vector-infraestructura/terraform.tfvars` con
+   `legacy_public_service_access = true` y `operator_cidr_blocks`, y ejecutar
+   `./vector-infraestructura/scripts/deploy.sh`. Plan esperado: se crea `aws_security_group.vector_clients`, y
+   `aws_security_group.chromadb`/`ollama` se actualizan in-place (se añade la
+   regla del SG de clientes y la del operador, se retira SSH `0.0.0.0/0`; la
+   regla pública de 8000/11434 conserva su descripción y no debe aparecer como
+   retirada y añadida). Ningún `must be replaced` ni `destroy`. Se actualiza el
+   tfvars de RAG. `deploy.sh` avisa mientras el acceso público siga abierto.
+2. **RAG**: `./rag/infrastructure/scripts/deploy.sh`. Plan esperado: nueva
+   revisión de `aws_ecs_task_definition.app` (`CHROMA_HOST`/`OLLAMA_BASE_URL`
+   con IP privada) y update in-place de `aws_ecs_service.app` (SG
+   `vector_clients` adjunto). Corte breve del backend (`minimum_healthy_percent
+   = 0`). Comprobar `/api/ready` y una consulta real.
+3. **Cierre**, en cuanto la fase 2 esté verificada: cambiar a
+   `legacy_public_service_access = false` en `vector-infraestructura/terraform.tfvars`
+   y repetir el paso 1. **Desde aquí el valor es `false` de forma permanente**:
+   no volver a `true` salvo como rollback, y fijar `false` en cualquier clon o
+   bastion nuevo (`terraform.tfvars` no se versiona). Plan esperado:
+   solo se retira la regla `0.0.0.0/0` de 8000 y 11434 (update in-place).
+   Comprobar desde fuera de `operator_cidr_blocks` que 8000/11434 no responden y
+   que la aplicación sigue funcionando.
+
+`legacy_public_service_access` no tiene valor por defecto: en un clon sin
+`terraform.tfvars` (p. ej. un bastion nuevo), `scripts/deploy.sh` se detiene
+antes de `terraform init` sin cambiar nada, y un `terraform plan/apply` manual
+pide el valor. Así, después de la fase 3, ninguna ejecución reabre 8000/11434
+sin una decisión explícita. Mientras valga `true`, `deploy.sh` lo avisa.
+
+Rollback de cada fase: volver a `legacy_public_service_access = true` (fase 3)
+o reaplicar con los valores anteriores; son cambios de reglas, sin reemplazos.
+
+### Pruebas sin AWS
+
+`terraform test` comprueba los planes de cada fase con un provider simulado
+(sin credenciales ni llamadas a AWS):
+
+```bash
+terraform -chdir=vector-infraestructura init -backend=false
+terraform -chdir=vector-infraestructura test
 ```

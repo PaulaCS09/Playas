@@ -206,3 +206,16 @@ destruir de forma consciente:
 4. `terraform plan -destroy`, revisar el plan y ejecutar `terraform destroy`,
    confirmando en el prompt.
 5. Restaurar las protecciones antes del siguiente despliegue.
+
+## Acceso a ChromaDB y Ollama por red privada
+
+El backend en ECS llega a ChromaDB y Ollama por **IP privada**, con el SG
+`vector_clients` de `vector-infraestructura` adjunto a las tareas del servicio
+`app` (variable `vector_clients_security_group_id`; vacía, no se adjunta).
+`vector-infraestructura/scripts/deploy.sh` rellena en `terraform.tfvars`
+`chroma_host`, `ollama_base_url` y `vector_clients_security_group_id`. El
+frontend no lleva ese SG. La migración en tres fases y las reglas están en
+[vector-infraestructura/README.md](../../vector-infraestructura/README.md#seguridad-de-red).
+
+Pruebas de plan sin AWS: `terraform -chdir=rag/infrastructure init -backend=false`
+y `terraform -chdir=rag/infrastructure test`.

@@ -1,0 +1,12 @@
+# Copiar a terraform.tfvars (no versionado) y completar.
+# Solo IPs públicas con máscara /32; 0.0.0.0/0 se rechaza.
+
+# Operador y bastion: acceso a ChromaDB (8000) y Ollama (11434) por IP pública.
+operator_cidr_blocks = ["203.0.113.10/32"]
+
+# SSH a las EC2. Vacío: SSH cerrado.
+ssh_cidr_blocks = []
+
+# Obligatoria. true SOLO durante las fases 1-2 de la migración de red; false
+# desde la fase 3 y en todo clon o bastion nuevo después de ella (ver README).
+legacy_public_service_access = false
