@@ -53,8 +53,8 @@ resource "aws_ecs_task_definition" "app" {
   container_definitions = jsonencode([
     # ── Postgres ──────────────────────────────────────────────────────────────
     {
-      name    = "postgres"
-      image   = "postgres:16-alpine"
+      name  = "postgres"
+      image = "postgres:16-alpine"
       # EFS no permite chown desde root; correr como postgres (uid 999) evita el intento
       user    = "999:999"
       command = ["sh", "-c", "rm -f /var/lib/postgresql/data/postmaster.pid && docker-entrypoint.sh postgres"]
@@ -73,8 +73,8 @@ resource "aws_ecs_task_definition" "app" {
       }
 
       environment = [
-        { name = "POSTGRES_DB",       value = "atlas" },
-        { name = "POSTGRES_USER",     value = "atlas" },
+        { name = "POSTGRES_DB", value = "atlas" },
+        { name = "POSTGRES_USER", value = "atlas" },
         { name = "POSTGRES_PASSWORD", value = var.postgres_password }
       ]
 
@@ -107,25 +107,25 @@ resource "aws_ecs_task_definition" "app" {
 
       environment = [
         # Postgres corre en localhost dentro de la misma tarea
-        { name = "DATABASE_URL",             value = "postgresql+asyncpg://atlas:${var.postgres_password}@localhost:5432/atlas" },
-        { name = "JWT_SECRET_KEY",           value = var.jwt_secret_key },
-        { name = "JWT_ALGORITHM",            value = var.jwt_algorithm },
-        { name = "JWT_EXPIRE_MINUTES",       value = tostring(var.jwt_expire_minutes) },
-        { name = "OPENAI_API_KEY",           value = var.openai_api_key },
-        { name = "OPENAI_MODEL",             value = var.openai_model },
-        { name = "OPENROUTER_API_KEY",       value = var.openrouter_api_key },
-        { name = "OPENROUTER_MODEL",         value = var.openrouter_model },
-        { name = "GOOGLE_API_KEY",           value = var.google_api_key },
-        { name = "GEMINI_MODEL",             value = var.gemini_model },
-        { name = "CHROMA_HOST",              value = var.chroma_host },
-        { name = "CHROMA_PORT",              value = tostring(var.chroma_port) },
-        { name = "CHROMA_COLLECTION",        value = var.chroma_collection },
-        { name = "OLLAMA_BASE_URL",          value = var.ollama_base_url },
-        { name = "OLLAMA_EMBEDDING_MODEL",   value = var.ollama_embedding_model },
-        { name = "OLLAMA_RERANKER_MODEL",    value = var.ollama_reranker_model },
+        { name = "DATABASE_URL", value = "postgresql+asyncpg://atlas:${var.postgres_password}@localhost:5432/atlas" },
+        { name = "JWT_SECRET_KEY", value = var.jwt_secret_key },
+        { name = "JWT_ALGORITHM", value = var.jwt_algorithm },
+        { name = "JWT_EXPIRE_MINUTES", value = tostring(var.jwt_expire_minutes) },
+        { name = "OPENAI_API_KEY", value = var.openai_api_key },
+        { name = "OPENAI_MODEL", value = var.openai_model },
+        { name = "OPENROUTER_API_KEY", value = var.openrouter_api_key },
+        { name = "OPENROUTER_MODEL", value = var.openrouter_model },
+        { name = "GOOGLE_API_KEY", value = var.google_api_key },
+        { name = "GEMINI_MODEL", value = var.gemini_model },
+        { name = "CHROMA_HOST", value = var.chroma_host },
+        { name = "CHROMA_PORT", value = tostring(var.chroma_port) },
+        { name = "CHROMA_COLLECTION", value = var.chroma_collection },
+        { name = "OLLAMA_BASE_URL", value = var.ollama_base_url },
+        { name = "OLLAMA_EMBEDDING_MODEL", value = var.ollama_embedding_model },
+        { name = "OLLAMA_RERANKER_MODEL", value = var.ollama_reranker_model },
         { name = "QUERY_ENRICHMENT_ENABLED", value = tostring(var.query_enrichment_enabled) },
-        { name = "S3_BUCKET_NAME",           value = var.s3_bucket_name },
-        { name = "REGISTER_ENABLED",         value = tostring(var.register_enabled) }
+        { name = "S3_BUCKET_NAME", value = var.s3_bucket_name },
+        { name = "REGISTER_ENABLED", value = tostring(var.register_enabled) }
       ]
 
       dependsOn = [{
@@ -169,7 +169,7 @@ resource "aws_ecs_task_definition" "frontend" {
 
     environment = [
       { name = "NODE_ENV", value = "production" },
-      { name = "PORT",     value = "3000" }
+      { name = "PORT", value = "3000" }
     ]
 
     logConfiguration = {
@@ -188,9 +188,9 @@ resource "aws_ecs_task_definition" "frontend" {
 # ── ECS Service: App ──────────────────────────────────────────────────────────
 
 resource "aws_ecs_service" "app" {
-  name                    = "${local.name_prefix}-app"
-  cluster                 = aws_ecs_cluster.main.id
-  task_definition         = aws_ecs_task_definition.app.arn
+  name                               = "${local.name_prefix}-app"
+  cluster                            = aws_ecs_cluster.main.id
+  task_definition                    = aws_ecs_task_definition.app.arn
   desired_count                      = 1
   launch_type                        = "FARGATE"
   enable_execute_command             = true
