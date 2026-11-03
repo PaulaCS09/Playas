@@ -8,6 +8,10 @@ on:
   pull_request:
     branches: [main]
 
+# Ningún job necesita escribir en el repositorio ni credenciales de AWS.
+permissions:
+  contents: read
+
 jobs:
   ingesta-quality:
     name: Ingesta — Lint
@@ -133,8 +137,16 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen --all-packages --group dev
 
+      # Los tests de scripts de despliegue, secretos y red (A1, A2, A5) se
+      # omiten si faltan bash u openssl: se exige que estén para que no se
+      # salten en silencio. -ra muestra cualquier test omitido.
+      - name: Check script test prerequisites
+        run: |
+          bash --version | head -1
+          openssl version
+
       - name: Run unit tests
-        run: uv run pytest tests/unit/ --cov=rag --cov-report=xml --cov-report=term-missing
+        run: uv run pytest tests/unit/ -ra --cov=rag --cov-report=xml --cov-report=term-missing
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4
@@ -171,3 +183,75 @@ jobs:
 
       - name: Build
         run: bun run build
+
+  infra-static:
+    name: Infra — Terraform y shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Solo validaciones estáticas: sin credenciales, sin backend remoto y sin
+    # contactar servicios desplegados. terraform init descarga los providers
+    # del registry; terraform test usa mock_provider (sin llamadas a AWS).
+    env:
+      AWS_EC2_METADATA_DISABLED: "true"
+      TF_IN_AUTOMATION: "true"
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
+      TF_STACKS: vector-infraestructura rag/infrastructure ingesta/infrastructure
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.17.1"
+          terraform_wrapper: false
+
+      # Reutiliza los providers entre ejecuciones; la clave cambia con los lock files.
+      - name: Cache Terraform providers
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.terraform-plugin-cache
+          key: tf-plugins-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+
+      # Debe existir antes de cualquier comando de Terraform (TF_PLUGIN_CACHE_DIR).
+      - name: Prepare plugin cache
+        run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
+
+      - name: Terraform fmt
+        run: |
+          for stack in $TF_STACKS; do
+            echo "::group::fmt $stack"
+            terraform -chdir="$stack" fmt -check -recursive -diff
+            echo "::endgroup::"
+          done
+
+      - name: Terraform init y validate (sin backend)
+        run: |
+          for stack in $TF_STACKS; do
+            echo "::group::validate $stack"
+            terraform -chdir="$stack" init -backend=false -lockfile=readonly -input=false
+            terraform -chdir="$stack" validate
+            echo "::endgroup::"
+          done
+
+      - name: Terraform test (mock_provider)
+        run: |
+          for stack in $TF_STACKS; do
+            if compgen -G "$stack/tests/*.tftest.hcl" > /dev/null; then
+              echo "::group::test $stack"
+              terraform -chdir="$stack" test
+              echo "::endgroup::"
+            fi
+          done
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.12.3"
+
+      # Todos los scripts versionados salvo las utilidades de SageMaker, que no
+      # forman parte del despliegue (sin shebang o con shebang en la línea 2).
+      - name: Shellcheck
+        run: |
+          mapfile -t scripts < <(git ls-files '*.sh' ':!rag/scripts/sagemaker-*.sh')
+          printf '%s\n' "${scripts[@]}"
+          uvx --from shellcheck-py==0.10.0.1 shellcheck -S warning "${scripts[@]}"
