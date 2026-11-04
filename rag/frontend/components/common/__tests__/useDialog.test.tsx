@@ -1,7 +1,7 @@
-import { useRef, useState } from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { StrictMode, useEffect, useRef, useState, type ReactNode } from "react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useDialog } from "@/components/common/useDialog";
 
 /**
@@ -242,4 +242,243 @@ describe("useDialog — primitiva local de diálogo", () => {
 		fireEvent.keyDown(document, { key: "Tab", code: "Tab", shiftKey: true });
 		expect(screen.getByRole("button", { name: "Cerrar" })).toHaveFocus();
 	});
+
+	it("el foco inicial ya está aplicado cuando el panel aparece en el DOM, aunque la apertura no venga de un evento de usuario", async () => {
+		// Reproduce la apertura de la búsqueda desde el panel móvil: llega
+		// desde `onExitComplete` de una animación (fuera de un evento de
+		// usuario y de `act`). En esa prioridad React difiere los efectos
+		// pasivos a una tarea posterior al commit; si el foco inicial se
+		// aplicara en un `useEffect`, habría una ventana con el diálogo ya
+		// montado y el foco todavía fuera (en <body>). El MutationObserver
+		// mira el foco justo después del commit, antes de esa tarea.
+		const controls = { open: () => {} };
+		function ExternalOpenHarness() {
+			const [open, setOpen] = useState(false);
+			useEffect(() => {
+				controls.open = () => setOpen(true);
+			}, []);
+			const inputRef = useRef<HTMLInputElement>(null);
+			const { panelRef, titleId } = useDialog({
+				open,
+				onClose: () => setOpen(false),
+				initialFocusRef: inputRef,
+			});
+			return open ? (
+				<div ref={panelRef} tabIndex={-1} role="dialog" aria-labelledby={titleId}>
+					<h2 id={titleId}>Búsqueda</h2>
+					<button type="button">Cerrar</button>
+					<input ref={inputRef} aria-label="Buscar" />
+				</div>
+			) : null;
+		}
+		render(<ExternalOpenHarness />);
+
+		const actEnvironment = globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean };
+		const previous = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+		actEnvironment.IS_REACT_ACT_ENVIRONMENT = false;
+		try {
+			const focusedWhenPanelAppeared = await new Promise<Element | null>((resolve) => {
+				const observer = new MutationObserver(() => {
+					if (!document.querySelector('[role="dialog"]')) return;
+					observer.disconnect();
+					resolve(document.activeElement);
+				});
+				observer.observe(document.body, { childList: true, subtree: true });
+				setTimeout(() => controls.open(), 0);
+			});
+			expect(focusedWhenPanelAppeared).toBe(screen.getByRole("textbox", { name: "Buscar" }));
+		} finally {
+			actEnvironment.IS_REACT_ACT_ENVIRONMENT = previous;
+		}
+	});
+});
+
+/**
+ * Panel para los escenarios de traspaso. Con `keepMountedWhileExiting`, el
+ * nodo sigue en el DOM durante el commit en que `open` pasa a false y se
+ * retira en una tarea posterior, como hace `AnimatePresence` con su
+ * animación de salida (caso de `MobileSidebar` y `ConversationSearchDialog`).
+ */
+function HandoffPanel({
+	open,
+	name,
+	onClose,
+	keepMountedWhileExiting,
+}: {
+	open: boolean;
+	name: string;
+	onClose: () => void;
+	keepMountedWhileExiting: boolean;
+}) {
+	const inputRef = useRef<HTMLInputElement>(null);
+	const [exiting, setExiting] = useState(false);
+	const [wasOpen, setWasOpen] = useState(open);
+	if (open !== wasOpen) {
+		setWasOpen(open);
+		if (!open && keepMountedWhileExiting) setExiting(true);
+	}
+	useEffect(() => {
+		if (!exiting) return;
+		const id = setTimeout(() => setExiting(false), 0);
+		return () => clearTimeout(id);
+	}, [exiting]);
+	const { panelRef, titleId } = useDialog({ open, onClose, initialFocusRef: inputRef });
+	if (!open && !exiting) return null;
+	return (
+		<div
+			ref={panelRef}
+			tabIndex={-1}
+			role="dialog"
+			aria-labelledby={titleId}
+			data-dialog-name={name}
+		>
+			<h2 id={titleId}>{name}</h2>
+			<input ref={inputRef} aria-label={`campo ${name}`} />
+			<button type="button">acción {name}</button>
+		</div>
+	);
+}
+
+/**
+ * Dos diálogos: "A" (equivalente al panel móvil) y "B" (equivalente a la
+ * búsqueda). Escape en A lo cierra y abre B en el mismo commit. `bFirst`
+ * invierte el orden de renderizado (y, por tanto, de sus efectos).
+ */
+function HandoffPair({
+	bFirst,
+	keepMountedWhileExiting,
+}: {
+	bFirst: boolean;
+	keepMountedWhileExiting: boolean;
+}) {
+	const [stage, setStage] = useState<"none" | "a" | "b">("none");
+	const [mounted, setMounted] = useState(true);
+	const a = (
+		<HandoffPanel
+			key="a"
+			name="A"
+			open={stage === "a"}
+			onClose={() => setStage("b")}
+			keepMountedWhileExiting={keepMountedWhileExiting}
+		/>
+	);
+	const b = (
+		<HandoffPanel
+			key="b"
+			name="B"
+			open={stage === "b"}
+			onClose={() => setStage("none")}
+			keepMountedWhileExiting={keepMountedWhileExiting}
+		/>
+	);
+	return (
+		<div>
+			<button type="button" onClick={() => setStage("a")}>
+				origen
+			</button>
+			<button type="button" onClick={() => setMounted(false)}>
+				desmontar diálogos
+			</button>
+			{mounted && (bFirst ? [b, a] : [a, b])}
+		</div>
+	);
+}
+
+describe("useDialog — traspaso del disparador entre diálogos en el mismo commit", () => {
+	let consoleMessages: unknown[][] = [];
+	beforeEach(() => {
+		consoleMessages = [];
+		vi.spyOn(console, "error").mockImplementation((...args) => consoleMessages.push(args));
+		vi.spyOn(console, "warn").mockImplementation((...args) => consoleMessages.push(args));
+	});
+	afterEach(() => {
+		vi.restoreAllMocks();
+		// Ningún aviso de React (act, efectos, claves...) en estos escenarios.
+		expect(consoleMessages).toEqual([]);
+	});
+
+	const scenarios = [
+		{ order: "A antes que B (orden de MobileSidebar y la búsqueda)", bFirst: false },
+		{ order: "B antes que A (orden inverso)", bFirst: true },
+	].flatMap((o) =>
+		[false, true].flatMap((keepMountedWhileExiting) =>
+			[false, true].map((strict) => ({ ...o, keepMountedWhileExiting, strict })),
+		),
+	);
+
+	function renderPair(scenario: (typeof scenarios)[number]) {
+		const tree: ReactNode = (
+			<HandoffPair
+				bFirst={scenario.bFirst}
+				keepMountedWhileExiting={scenario.keepMountedWhileExiting}
+			/>
+		);
+		return render(scenario.strict ? <StrictMode>{tree}</StrictMode> : tree);
+	}
+
+	async function waitForExitsToFinish() {
+		await waitFor(() => expect(document.querySelectorAll('[role="dialog"]').length).toBeLessThanOrEqual(1));
+	}
+
+	it.each(scenarios)(
+		"$order, panel montado durante la salida: $keepMountedWhileExiting, StrictMode: $strict — B recibe el foco, Tab queda dentro y al cerrar vuelve al disparador original",
+		async (scenario) => {
+			const user = userEvent.setup();
+			renderPair(scenario);
+			const origin = screen.getByRole("button", { name: "origen" });
+			await user.click(origin);
+			expect(screen.getByRole("textbox", { name: "campo A" })).toHaveFocus();
+
+			// A se cierra y B se abre en el mismo commit.
+			await user.keyboard("{Escape}");
+			const inputB = screen.getByRole("textbox", { name: "campo B" });
+			expect(inputB).toHaveFocus();
+			await waitForExitsToFinish();
+			expect(inputB).toHaveFocus();
+
+			const panelB = inputB.closest('[role="dialog"]') as HTMLElement;
+			await user.tab();
+			expect(panelB.contains(document.activeElement)).toBe(true);
+			await user.tab({ shift: true });
+			expect(panelB.contains(document.activeElement)).toBe(true);
+
+			const focusSpy = vi.spyOn(origin, "focus");
+			await user.keyboard("{Escape}");
+			expect(document.activeElement).toBe(origin);
+			// Una sola restauración, sin repetirse al terminar la salida.
+			await waitFor(() => expect(document.querySelectorAll('[role="dialog"]').length).toBe(0));
+			expect(focusSpy).toHaveBeenCalledTimes(1);
+			expect(document.activeElement).toBe(origin);
+		},
+	);
+
+	it.each(scenarios)(
+		"$order, panel montado durante la salida: $keepMountedWhileExiting, StrictMode: $strict — desmontar los diálogos con B abierto devuelve el foco al disparador original y el registro no queda obsoleto",
+		async (scenario) => {
+			const user = userEvent.setup();
+			const { unmount } = renderPair(scenario);
+			const origin = screen.getByRole("button", { name: "origen" });
+			await user.click(origin);
+			await user.keyboard("{Escape}");
+			expect(screen.getByRole("textbox", { name: "campo B" })).toHaveFocus();
+			await waitForExitsToFinish();
+
+			const focusSpy = vi.spyOn(origin, "focus");
+			// fireEvent no mueve el foco: B sigue enfocado al desmontarse.
+			fireEvent.click(screen.getByRole("button", { name: "desmontar diálogos" }));
+			expect(document.activeElement).toBe(origin);
+			expect(focusSpy).toHaveBeenCalledTimes(1);
+			unmount();
+
+			// Un diálogo nuevo, tras el desmontaje anterior, se comporta igual:
+			// ninguna entrada obsoleta del registro le altera el disparador.
+			renderPair(scenario);
+			const newOrigin = screen.getByRole("button", { name: "origen" });
+			await user.click(newOrigin);
+			await user.keyboard("{Escape}");
+			await waitForExitsToFinish();
+			await user.keyboard("{Escape}");
+			expect(document.activeElement).toBe(newOrigin);
+		},
+	);
 });
