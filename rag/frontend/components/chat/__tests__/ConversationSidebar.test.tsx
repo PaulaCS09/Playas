@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { StrictMode, useState } from "react";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConversationSidebar } from "@/components/chat/ConversationSidebar";
 import type { Conversation } from "@/hooks/useConversations";
 
@@ -360,5 +360,47 @@ describe("ConversationSidebar — panel móvil, menú de perfil anidado", () => 
 
 		await user.keyboard("{Escape}");
 		expect(onCloseMobile).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("ConversationSidebar — búsqueda abierta desde móvil bajo StrictMode", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("foco inicial en el campo, Tab/Shift+Tab dentro y Escape devuelve el foco al botón externo, sin avisos de React", async () => {
+		const consoleMessages: unknown[][] = [];
+		vi.spyOn(console, "error").mockImplementation((...args) => consoleMessages.push(args));
+		vi.spyOn(console, "warn").mockImplementation((...args) => consoleMessages.push(args));
+		const user = userEvent.setup();
+		render(
+			<StrictMode>
+				<ParentHarness />
+			</StrictMode>,
+		);
+
+		const openButton = screen.getByRole("button", { name: "Abrir panel móvil" });
+		await user.click(openButton);
+		const mobileDialog = screen.getByRole("dialog", {
+			name: "Historial de conversaciones",
+		});
+		await user.click(
+			within(mobileDialog).getByRole("button", { name: "Buscar conversaciones" }),
+		);
+
+		const searchDialog = await screen.findByRole("dialog", {
+			name: "Buscar conversaciones",
+		});
+		expect(
+			within(searchDialog).getByPlaceholderText("Buscar conversaciones…"),
+		).toHaveFocus();
+		await user.tab({ shift: true });
+		expect(searchDialog.contains(document.activeElement)).toBe(true);
+		await user.tab();
+		expect(searchDialog.contains(document.activeElement)).toBe(true);
+
+		await user.keyboard("{Escape}");
+		expect(document.activeElement).toBe(openButton);
+		expect(consoleMessages).toEqual([]);
 	});
 });
