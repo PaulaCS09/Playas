@@ -58,6 +58,15 @@ esac
 FAKE_AWS = """#!/usr/bin/env bash
 echo "aws $*" >> "${CALL_LOG}"
 case "$*" in
+  *"sts get-caller-identity"*)
+    [[ -n "${FAKE_STS_FAIL:-}" ]] && { echo "ExpiredToken" >&2; exit 255; }
+    echo "${FAKE_ACCOUNT:-000000000000}" ;;
+  *"s3api head-bucket"*)
+    [[ -n "${FAKE_HEAD_BUCKET_FAIL:-}" ]] && { echo "Not Found (404)" >&2; exit 254; }
+    exit 0 ;;
+  *"ec2 describe-instances"*)
+    [[ -n "${FAKE_EC2_FAIL:-}" ]] && { echo "UnauthorizedOperation" >&2; exit 254; }
+    echo "${FAKE_VECTOR_INSTANCES:-}" ;;
   *describe-vpcs*) echo "vpc-123" ;;
   *describe-security-groups*CidrIpv6*) echo "${FAKE_SG_V6:-}" ;;
   *describe-security-groups*CidrIp*) echo "${FAKE_SG_V4:-}" ;;
@@ -485,6 +494,14 @@ def test_bastion_new_sg_announces_rule_before_creating_it(tmp_path: Path) -> Non
 # Backend S3: inicialización y respaldo sin fallos silenciosos
 # ---------------------------------------------------------------------------
 
+# Lo que devuelve Terraform 1.17.1 con `state pull` contra una key S3 que aún no
+# existe (verificado con Terraform real y un S3 simulado local): no es una
+# salida vacía, sino un state vacío con lineage "".
+EMPTY_REMOTE_STATE = (
+    '{\n  "version": 4,\n  "terraform_version": "1.17.1",\n  "serial": 0,\n'
+    '  "lineage": "",\n  "outputs": {},\n  "resources": [],\n  "check_results": null\n}\n'
+)
+
 S3_BACKEND_TF = """terraform {
   backend "s3" {
     key          = "stack/terraform.tfstate"
@@ -559,17 +576,29 @@ def test_s3_backend_backup_stops_when_state_pull_fails(
     assert not list((tmp_path / "backups").rglob("*.partial"))
 
 
+@pytest.mark.parametrize(
+    "pulled",
+    [
+        pytest.param("", id="salida-vacia"),
+        pytest.param(EMPTY_REMOTE_STATE, id="json-terraform-1.17"),
+        pytest.param('{"serial":0,"lineage":"","resources":[]}', id="json-compacto"),
+    ],
+)
 @pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
 def test_s3_backend_empty_state_needs_explicit_opt_in(
-    script: Path, stack: str, tmp_path: Path
+    script: Path, stack: str, pulled: str, tmp_path: Path
 ) -> None:
     copy, _, _ = _s3_stack(script, tmp_path)
-    result, calls = _run(copy, tmp_path)
+    result, calls = _run(copy, tmp_path, env_extra={"FAKE_STATE_PULL": pulled})
     assert result.returncode != 0
     assert "ALLOW_EMPTY_STATE=1" in result.stderr
     assert not any(" apply" in c for c in calls)
+    # Un state vacío no se guarda como si fuera un respaldo válido.
+    assert not list((tmp_path / "backups").rglob("remote.tfstate"))
 
-    result, calls = _run(copy, tmp_path, env_extra={"ALLOW_EMPTY_STATE": "1"})
+    result, calls = _run(
+        copy, tmp_path, env_extra={"FAKE_STATE_PULL": pulled, "ALLOW_EMPTY_STATE": "1"}
+    )
     assert "stack nuevo" in result.stdout
     assert any(" apply" in c and "-auto-approve" not in c for c in calls)
 
@@ -726,3 +755,576 @@ def test_gitignore_keeps_states_out_but_tracks_backend_code() -> None:
         "vector-infraestructura/.terraform.lock.hcl",
     ):
         assert not ignored(path), path
+
+
+# ---------------------------------------------------------------------------
+# Bastion: ALLOW_EMPTY_STATE solo se transmite cuando se pide expresamente
+# ---------------------------------------------------------------------------
+
+FULL_FAKE_AWS = """#!/usr/bin/env bash
+echo "aws $*" >> "${CALL_LOG}"
+case "$*" in
+  *"sts get-caller-identity"*) echo "${FAKE_ACCOUNT:-000000000000}" ;;
+  *describe-vpcs*) echo "vpc-123" ;;
+  *describe-security-groups*CidrIpv6*) echo "" ;;
+  *describe-security-groups*CidrIp*) echo "${BASTION_SSH_CIDR}" ;;
+  *describe-security-groups*) echo "sg-bastion" ;;
+  *describe-images*) echo "ami-123" ;;
+  *describe-instances*PublicIpAddress*) echo "203.0.113.50" ;;
+  *describe-instances*) echo "None" ;;
+  *run-instances*) echo "i-123" ;;
+esac
+exit 0
+"""
+
+# Registra cada comando remoto en una línea; consume el heredoc solo si stdin
+# no es una terminal (los `ssh -t` reciben la pseudo-terminal del test).
+FAKE_SSH = """#!/usr/bin/env bash
+all="$*"
+echo "ssh ${all//$'\\n'/ }" >> "${SSH_LOG}"
+[[ -t 0 ]] || cat > /dev/null
+exit 0
+"""
+
+
+def _run_full_bastion(tmp_path: Path, env_extra: dict[str, str] | None = None):
+    copy, env = _bastion_repo(tmp_path)
+    # Directorio propio, por delante en el PATH: _run reinstala los falsos por defecto.
+    full_bin = tmp_path / "bin-full"
+    full_bin.mkdir()
+    for name, body in (
+        ("aws", FULL_FAKE_AWS),
+        ("ssh", FAKE_SSH),
+        ("scp", "#!/usr/bin/env bash\nexit 0\n"),
+    ):
+        (full_bin / name).write_text(body)
+        (full_bin / name).chmod(0o755)
+    ssh_log = tmp_path / "ssh.log"
+    ssh_log.touch()
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={
+            **env,
+            "PATH": f"{full_bin}{os.pathsep}{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}",
+            "BASTION_SSH_CIDR": "203.0.113.10/32",
+            "SSH_LOG": str(ssh_log),
+            **(env_extra or {}),
+        },
+    )
+    deploys = [
+        line
+        for line in ssh_log.read_text().splitlines()
+        if line.startswith("ssh -t ") and "scripts/deploy.sh" in line
+    ]
+    return result, calls, deploys
+
+
+def test_bastion_does_not_forward_allow_empty_state_by_default(tmp_path: Path) -> None:
+    result, _, deploys = _run_full_bastion(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(deploys) == 2
+    assert all("ALLOW_EMPTY_STATE" not in d for d in deploys)
+
+
+def test_bastion_forwards_allow_empty_state_only_when_requested(tmp_path: Path) -> None:
+    result, _, deploys = _run_full_bastion(tmp_path, {"ALLOW_EMPTY_STATE": "1"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "solo en esta ejecución" in result.stdout
+    vector, rag = deploys
+    # Asignación del propio comando, nunca `export`.
+    assert "&& ALLOW_EMPTY_STATE=1 ./vector-infraestructura/scripts/deploy.sh" in vector
+    assert "sg docker -c 'ALLOW_EMPTY_STATE=1 ./rag/infrastructure/scripts/deploy.sh'" in rag
+    assert all("export ALLOW_EMPTY_STATE" not in d for d in deploys)
+
+
+@pytest.mark.parametrize("value", ["yes", "true", "2", " 1"])
+def test_bastion_rejects_ambiguous_allow_empty_state(value: str, tmp_path: Path) -> None:
+    copy, env = _bastion_repo(tmp_path)
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={**env, "BASTION_SSH_CIDR": "203.0.113.10/32", "ALLOW_EMPTY_STATE": value},
+    )
+    assert result.returncode != 0
+    assert "ALLOW_EMPTY_STATE solo admite 1" in result.stdout
+    assert calls == []
+
+
+def test_bastion_never_exports_allow_empty_state() -> None:
+    code = "\n".join(_code_lines(BASTION))
+    assert not re.search(r"\bexport\s+ALLOW_EMPTY_STATE\b", code)
+    assignments = re.findall(r'REMOTE_DEPLOY_ENV="([^"]*)"', code)
+    assert sorted(set(assignments)) == ["", "ALLOW_EMPTY_STATE=1 "]
+    deploy_lines = [c for c in _logical_commands(code) if re.search(r"\./\S*scripts/deploy\.sh", c)]
+    assert len(deploy_lines) == 2
+    assert all("${REMOTE_DEPLOY_ENV}./" in c for c in deploy_lines)
+
+
+# ---------------------------------------------------------------------------
+# Backend S3: la cuenta del bucket debe ser la de las credenciales
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("bucket", "env", "message"),
+    [
+        pytest.param(
+            "rag-playas-tfstate-111111111111", {}, "no es de la cuenta actual", id="otra-cuenta"
+        ),
+        pytest.param("mi-bucket-del-state", {}, "debe contener bucket", id="nombre-no-convenido"),
+        pytest.param(
+            "rag-playas-tfstate-000000000000",
+            {"FAKE_STS_FAIL": "1"},
+            "No se pudo verificar la cuenta",
+            id="sts-falla",
+        ),
+        pytest.param(
+            "rag-playas-tfstate-000000000000",
+            {"RAG_EXPECTED_AWS_ACCOUNT_ID": "222222222222"},
+            "RAG_EXPECTED_AWS_ACCOUNT_ID",
+            id="cuenta-esperada-distinta",
+        ),
+    ],
+)
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_s3_backend_requires_bucket_of_current_account(
+    script: Path, stack: str, bucket: str, env: dict[str, str], message: str, tmp_path: Path
+) -> None:
+    copy, _, backend = _s3_stack(script, tmp_path)
+    backend.write_text(f'bucket = "{bucket}"\n')
+    result, calls = _run(copy, tmp_path, env_extra={"ALLOW_EMPTY_STATE": "1", **env})
+    assert result.returncode != 0
+    assert message in result.stderr
+    # Se detiene antes de inicializar el backend.
+    assert not any(c.startswith("terraform") for c in calls)
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        pytest.param(
+            'bucket = "rag-playas-tfstate-000000000000"\nkey = "rag-infrastructure/terraform.tfstate"\n',
+            "línea 2 (key)",
+            id="key",
+        ),
+        pytest.param(
+            'region = "eu-west-1"\nbucket = "rag-playas-tfstate-000000000000"\n',
+            "línea 1 (region)",
+            id="region",
+        ),
+        pytest.param(
+            'bucket = "rag-playas-tfstate-000000000000"\nendpoints = { s3 = "http://x" }\n',
+            "(endpoints)",
+            id="endpoints",
+        ),
+        pytest.param(
+            'bucket = "rag-playas-tfstate-000000000000"\nprofile = "otro"\n',
+            "(profile)",
+            id="profile",
+        ),
+        pytest.param(
+            'bucket = "rag-playas-tfstate-000000000000"\naccess_key = "AKIAEXAMPLESECRET"\n',
+            "(access_key)",
+            id="credencial",
+        ),
+        pytest.param(
+            'bucket = "rag-playas-tfstate-000000000000"\nbucket = "rag-playas-tfstate-000000000000"\n',
+            "exactamente una línea bucket (hay 2)",
+            id="bucket-duplicado",
+        ),
+        pytest.param(
+            "# solo un comentario\n", "exactamente una línea bucket (hay 0)", id="sin-bucket"
+        ),
+        pytest.param(
+            'bucket = "rag-playas-tfstate-000000000000" key = "x"\n',
+            "línea 1 (bucket)",
+            id="dos-atributos-en-una-linea",
+        ),
+        # Una línea sin forma `nombre =` no expone su contenido.
+        pytest.param(
+            'bucket = "rag-playas-tfstate-000000000000"\nAKIAEXAMPLESECRET\n',
+            "línea 2 (?)",
+            id="linea-suelta",
+        ),
+        pytest.param(
+            "bucket = 'rag-playas-tfstate-000000000000'\n",
+            "línea 1 (bucket): formato no admitido",
+            id="comillas-simples",
+        ),
+        pytest.param(
+            'bucket = "rag-playas-tfstate-000000000000" # bucket del lab\n',
+            "línea 1 (bucket): formato no admitido",
+            id="comentario-final",
+        ),
+    ],
+)
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_s3_backend_config_only_allows_bucket(
+    script: Path, stack: str, content: str, message: str, tmp_path: Path
+) -> None:
+    """-backend-config tiene prioridad sobre el bloque backend: una key en el
+    backend.hcl compartido haría que los tres stacks usaran el mismo state."""
+    copy, _, backend = _s3_stack(script, tmp_path)
+    backend.write_text(content)
+    result, calls = _run(copy, tmp_path, env_extra={"ALLOW_EMPTY_STATE": "1"})
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert "AKIAEXAMPLESECRET" not in result.stdout + result.stderr
+    # Se detiene antes de consultar AWS o inicializar Terraform.
+    assert not any(c.startswith(("terraform", "aws")) for c in calls)
+
+
+def test_s3_backend_config_accepts_comments_and_blank_lines(tmp_path: Path) -> None:
+    copy, _, backend = _s3_stack(VECTOR_DEPLOY, tmp_path)
+    backend.write_text(
+        '# Bucket del state\n\n  # sangrado\nbucket = "rag-playas-tfstate-000000000000"  \n'
+    )
+    result, calls = _run(copy, tmp_path, env_extra={"FAKE_STATE_PULL": EMPTY_REMOTE_STATE})
+    assert "solo se admite" not in result.stderr
+    assert any(" init -input=false" in c for c in calls)
+
+
+def test_backend_example_and_stack_keys_are_consistent() -> None:
+    """backend.hcl.example solo lleva bucket y cada stack fija una key distinta."""
+    example = [
+        line
+        for line in (REPO_ROOT / "backend.hcl.example").read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert example == ['bucket = "rag-playas-tfstate-<ACCOUNT_ID>"']
+    expected = {
+        "ingesta/infrastructure": "ingesta/terraform.tfstate",
+        "vector-infraestructura": "vector-infraestructura/terraform.tfstate",
+        "rag/infrastructure": "rag-infrastructure/terraform.tfstate",
+    }
+    for stack, key in expected.items():
+        keys = re.findall(
+            r'^\s*key\s*=\s*"([^"]+)"', (REPO_ROOT / stack / "terraform.tf").read_text(), re.M
+        )
+        assert keys == [key], stack
+
+
+def test_vector_empty_remote_state_refuses_existing_instances(tmp_path: Path) -> None:
+    """State remoto vacío + EC2 ya existentes = bucket o key equivocados: no
+    se crean duplicados aunque se haya pedido ALLOW_EMPTY_STATE=1."""
+    copy, _, _ = _s3_stack(VECTOR_DEPLOY, tmp_path)
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={
+            "FAKE_STATE_PULL": EMPTY_REMOTE_STATE,
+            "ALLOW_EMPTY_STATE": "1",
+            "FAKE_VECTOR_INSTANCES": "i-0abc\ti-0def",
+        },
+    )
+    assert result.returncode != 0
+    assert "ya existen EC2" in result.stderr
+    assert not any(" apply" in c for c in calls)
+    # Solo consultas de lectura a AWS.
+    aws_calls = [c for c in calls if c.startswith("aws")]
+    assert any("ec2 describe-instances" in c for c in aws_calls)
+    assert all(
+        any(
+            op in c for op in ("sts get-caller-identity", "s3api head-bucket", "describe-instances")
+        )
+        for c in aws_calls
+    )
+    # Busca las dos EC2 del stack en cualquier estado no terminado.
+    describe = [c for c in aws_calls if "ec2 describe-instances" in c]
+    assert len(describe) == 1
+    assert "Name=tag:Name,Values=rag-playas-chromadb,rag-playas-ollama" in describe[0]
+    assert "Name=instance-state-name,Values=pending,running,stopping,stopped" in describe[0]
+
+
+def test_rag_empty_remote_state_with_existing_sgs_stops(tmp_path: Path) -> None:
+    copy, _, _ = _s3_stack(RAG_DEPLOY, tmp_path)
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={
+            "FAKE_STATE_PULL": EMPTY_REMOTE_STATE,
+            "ALLOW_EMPTY_STATE": "1",
+            "FAKE_AWS_SG_ID": "sg-existente",
+        },
+    )
+    assert result.returncode != 0
+    assert "Despliegue detenido sin cambios" in result.stderr
+    assert "El state remoto está vacío pero ya existe el SG" in result.stderr
+    assert (
+        "Revisar backend.hcl y la key antes de desplegar: no importar ni crear duplicados."
+        in result.stderr
+    )
+    # Sin sugerencias de state rm/import: se aplicarían a un state equivocado.
+    output = result.stdout + result.stderr
+    assert "state rm" not in output
+    assert "import aws_security_group" not in output
+    assert not any(" state list" in c for c in calls)  # vacío conocido: sin state list
+    assert not any(" state rm" in c or " import" in c for c in calls)
+    assert not any(" apply" in c for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# Backend S3: existencia del bucket y variables que desvían el backend
+# ---------------------------------------------------------------------------
+
+BACKEND_OVERRIDE_VARS = [
+    "AWS_ENDPOINT_URL",
+    "AWS_ENDPOINT_URL_S3",
+    "AWS_ENDPOINT_URL_STS",
+    "AWS_S3_ENDPOINT",
+    "AWS_STS_ENDPOINT",
+    "TF_WORKSPACE",
+]
+
+REAL_REMOTE_STATE = '{"version": 4, "serial": 1, "lineage": "9f1c-real", "resources": []}'
+
+
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_s3_backend_stops_when_bucket_is_missing_or_foreign(
+    script: Path, stack: str, tmp_path: Path
+) -> None:
+    copy, _, _ = _s3_stack(script, tmp_path)
+    result, calls = _run(
+        copy, tmp_path, env_extra={"ALLOW_EMPTY_STATE": "1", "FAKE_HEAD_BUCKET_FAIL": "1"}
+    )
+    assert result.returncode != 0
+    assert (
+        "✗ El bucket del state rag-playas-tfstate-000000000000 no existe o no pertenece a la"
+        " cuenta 000000000000. Crearlo con scripts/bootstrap_tfstate_bucket.sh." in result.stderr
+    )
+    assert not any(c.startswith("terraform") for c in calls)
+
+
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_s3_backend_checks_bucket_owner_before_init(
+    script: Path, stack: str, tmp_path: Path
+) -> None:
+    copy, _, _ = _s3_stack(script, tmp_path)
+    _, calls = _run(copy, tmp_path, env_extra={"FAKE_STATE_PULL": REAL_REMOTE_STATE})
+    sts = [i for i, c in enumerate(calls) if "sts get-caller-identity" in c]
+    head = [i for i, c in enumerate(calls) if "s3api head-bucket" in c]
+    init = [i for i, c in enumerate(calls) if " init -input=false" in c]
+    assert len(sts) == 1 and len(head) == 1 and len(init) == 1
+    assert sts[0] < head[0] < init[0]
+    assert "--region us-east-1" in calls[sts[0]]
+    head_args = calls[head[0]].split()
+    assert head_args[head_args.index("--bucket") + 1] == "rag-playas-tfstate-000000000000"
+    assert head_args[head_args.index("--expected-bucket-owner") + 1] == "000000000000"
+    assert head_args[head_args.index("--region") + 1] == "us-east-1"
+
+
+@pytest.mark.parametrize("var", BACKEND_OVERRIDE_VARS)
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_s3_backend_refuses_endpoint_and_workspace_overrides(
+    script: Path, stack: str, var: str, tmp_path: Path
+) -> None:
+    copy, _, _ = _s3_stack(script, tmp_path)
+    result, calls = _run(
+        copy, tmp_path, env_extra={"ALLOW_EMPTY_STATE": "1", var: "http://127.0.0.1:9000"}
+    )
+    assert result.returncode != 0
+    assert (
+        f"✗ {var} está definida y desviaría el backend S3 o la key del state."
+        f" Ejecutar 'unset {var}' y repetir." in result.stderr
+    )
+    assert "127.0.0.1" not in result.stdout + result.stderr  # nunca el valor
+    assert calls == []
+
+
+def test_s3_backend_ignores_empty_override_vars(tmp_path: Path) -> None:
+    copy, _, _ = _s3_stack(VECTOR_DEPLOY, tmp_path)
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={
+            "FAKE_STATE_PULL": REAL_REMOTE_STATE,
+            **dict.fromkeys(BACKEND_OVERRIDE_VARS, ""),
+        },
+    )
+    assert "está definida" not in result.stderr
+    assert any(" init -input=false" in c for c in calls)
+    assert any(" apply" in c for c in calls)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(b'bucket = "rag-playas-tfstate-000000000000"\r\n', id="crlf"),
+        pytest.param(b'bucket = "rag-playas-tfstate-000000000000"', id="sin-salto-final"),
+        pytest.param(b'bucket="rag-playas-tfstate-000000000000"\n', id="sin-espacios"),
+    ],
+)
+def test_s3_backend_config_accepts_equivalent_formats(content: bytes, tmp_path: Path) -> None:
+    copy, _, backend = _s3_stack(VECTOR_DEPLOY, tmp_path)
+    backend.write_bytes(content)
+    result, calls = _run(copy, tmp_path, env_extra={"FAKE_STATE_PULL": REAL_REMOTE_STATE})
+    assert "solo se admite" not in result.stderr
+    assert "formato no admitido" not in result.stderr
+    assert any(" init -input=false" in c and f"-backend-config={backend}" in c for c in calls)
+
+
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_s3_backend_backs_up_real_state_without_resources(
+    script: Path, stack: str, tmp_path: Path
+) -> None:
+    """Un state con lineage real y sin recursos no es "vacío": se respalda sin
+    ALLOW_EMPTY_STATE."""
+    copy, _, _ = _s3_stack(script, tmp_path)
+    result, calls = _run(copy, tmp_path, env_extra={"FAKE_STATE_PULL": REAL_REMOTE_STATE})
+    assert "ALLOW_EMPTY_STATE" not in result.stderr
+    assert "stack nuevo" not in result.stdout
+    backups = list((tmp_path / "backups" / stack).glob("*/remote.tfstate"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == REAL_REMOTE_STATE
+    assert any(" apply" in c for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# Vector: comprobación de EC2 existentes con state remoto vacío
+# ---------------------------------------------------------------------------
+
+
+def test_vector_empty_remote_state_stops_when_ec2_check_fails(tmp_path: Path) -> None:
+    copy, _, _ = _s3_stack(VECTOR_DEPLOY, tmp_path)
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={
+            "FAKE_STATE_PULL": EMPTY_REMOTE_STATE,
+            "ALLOW_EMPTY_STATE": "1",
+            "FAKE_EC2_FAIL": "1",
+        },
+    )
+    assert result.returncode != 0
+    assert "No se pudo comprobar si ya existen las EC2" in result.stderr
+    assert not any(" apply" in c for c in calls)
+
+
+@pytest.mark.parametrize(
+    "instances",
+    [
+        pytest.param("", id="vacio"),
+        pytest.param("None", id="none"),
+        pytest.param(" \t ", id="espacios"),
+    ],
+)
+def test_vector_empty_remote_state_without_instances_continues(
+    instances: str, tmp_path: Path
+) -> None:
+    copy, _, _ = _s3_stack(VECTOR_DEPLOY, tmp_path)
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={
+            "FAKE_STATE_PULL": EMPTY_REMOTE_STATE,
+            "ALLOW_EMPTY_STATE": "1",
+            "FAKE_VECTOR_INSTANCES": instances,
+        },
+    )
+    assert "ya existen EC2" not in result.stderr
+    assert any("ec2 describe-instances" in c for c in calls)
+    assert any(" apply" in c and "-auto-approve" not in c for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# Bastion: el backend S3 se valida antes de crear nada en AWS
+# ---------------------------------------------------------------------------
+
+_BASTION_READ_ONLY_OPS = ("sts get-caller-identity", "s3api head-bucket")
+_BASTION_FORBIDDEN_OPS = (
+    "create-security-group",
+    "authorize-",
+    "run-instances",
+    "describe-images",
+)
+
+
+def _bastion_s3_backend(tmp_path: Path, backend: str | None) -> Path:
+    """Declara backend "s3" en los dos stacks del repo temporal del bastion."""
+    repo = tmp_path / "repo"
+    for stack in ("vector-infraestructura", "rag/infrastructure"):
+        (repo / stack).mkdir(parents=True, exist_ok=True)
+        (repo / stack / "terraform.tf").write_text(S3_BACKEND_TF)
+    backend_hcl = repo / "backend.hcl"
+    if backend is not None:
+        backend_hcl.write_text(backend)
+    return backend_hcl
+
+
+@pytest.mark.parametrize(
+    ("backend", "env", "message"),
+    [
+        pytest.param(None, {}, "Falta {backend_hcl}", id="sin-backend-hcl"),
+        pytest.param(
+            'bucket = "rag-playas-tfstate-000000000000"\nkey = "otro/terraform.tfstate"\n',
+            {},
+            "línea 2 (key)",
+            id="key-extra",
+        ),
+        pytest.param(
+            'bucket = "rag-playas-tfstate-111111111111"\n',
+            {},
+            "no es de la cuenta actual",
+            id="otra-cuenta",
+        ),
+        pytest.param(
+            'bucket = "rag-playas-tfstate-000000000000"\n',
+            {"AWS_ENDPOINT_URL_S3": "http://127.0.0.1:9000"},
+            "AWS_ENDPOINT_URL_S3 está definida",
+            id="endpoint-s3",
+        ),
+        pytest.param(
+            'bucket = "rag-playas-tfstate-000000000000"\n',
+            {"FAKE_HEAD_BUCKET_FAIL": "1"},
+            "no existe o no pertenece a la cuenta 000000000000",
+            id="bucket-inexistente",
+        ),
+    ],
+)
+def test_bastion_validates_s3_backend_before_any_aws_write(
+    backend: str | None, env: dict[str, str], message: str, tmp_path: Path
+) -> None:
+    backend_hcl = _bastion_s3_backend(tmp_path, backend)
+    copy, bastion_env = _bastion_repo(tmp_path)
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={**bastion_env, "BASTION_SSH_CIDR": "203.0.113.10/32", **env},
+    )
+    assert result.returncode != 0
+    # fail() escribe en stdout y tf_fail() en stderr.
+    assert message.format(backend_hcl=backend_hcl) in result.stdout + result.stderr
+    aws_calls = [c for c in calls if c.startswith("aws")]
+    assert all(any(op in c for op in _BASTION_READ_ONLY_OPS) for c in aws_calls), aws_calls
+    assert not any(op in c for c in calls for op in _BASTION_FORBIDDEN_OPS)
+    assert "Prerrequisitos OK" not in result.stdout
+
+
+def test_bastion_valid_s3_backend_continues_after_read_only_checks(tmp_path: Path) -> None:
+    _bastion_s3_backend(tmp_path, 'bucket = "rag-playas-tfstate-000000000000"\n')
+    copy, env = _bastion_repo(tmp_path)
+    result, calls = _run(
+        copy, tmp_path, env_extra={**env, "BASTION_SSH_CIDR": "203.0.113.10/32"}, merge_stderr=True
+    )
+    # Supera la validación y se detiene más adelante al no encontrar AMI (aws falso).
+    assert "Prerrequisitos OK" in result.stdout
+    assert "No se encontró una AMI" in result.stdout
+    sts = [i for i, c in enumerate(calls) if "sts get-caller-identity" in c]
+    head = [i for i, c in enumerate(calls) if "s3api head-bucket" in c]
+    vpcs = [i for i, c in enumerate(calls) if "describe-vpcs" in c]
+    assert sts and head and vpcs and sts[0] < head[0] < vpcs[0]
+    assert "--expected-bucket-owner 000000000000" in calls[head[0]]
+
+
+def test_bastion_valid_s3_backend_ships_backend_hcl(tmp_path: Path) -> None:
+    _bastion_s3_backend(tmp_path, 'bucket = "rag-playas-tfstate-000000000000"\n')
+    result, calls, deploys = _run_full_bastion(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert any("s3api head-bucket" in c for c in calls)
+    assert "backend.hcl copiado al bastion" in result.stdout
+    ships = [
+        line for line in (tmp_path / "ssh.log").read_text().splitlines() if "backend.hcl" in line
+    ]
+    assert len(ships) == 1
+    assert len(deploys) == 2

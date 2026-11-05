@@ -81,6 +81,24 @@ tf_init "${VECTOR_INFRA_DIR}" "${REPO_ROOT}"
 
 backup_state "${VECTOR_INFRA_DIR}" "vector-infraestructura"
 
+# Con el state remoto vacío (ALLOW_EMPTY_STATE=1) se crearían de nuevo todas
+# las EC2. Si ya existen en la cuenta, el bucket o la key no son los correctos:
+# se detiene en lugar de duplicarlas (consulta de solo lectura).
+if [[ "${TF_REMOTE_STATE_EMPTY}" -eq 1 ]]; then
+  if ! existing=$(aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=rag-playas-chromadb,rag-playas-ollama" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[].Instances[].InstanceId' --output text --region us-east-1); then
+    echo "✗ No se pudo comprobar si ya existen las EC2 de ChromaDB/Ollama." >&2
+    exit 1
+  fi
+  if [[ -n "${existing//[[:space:]]/}" && "${existing}" != "None" ]]; then
+    echo "✗ El state remoto está vacío pero ya existen EC2 de ChromaDB/Ollama (${existing})." >&2
+    echo "  Revisar backend.hcl y la key antes de desplegar: no se crean duplicados." >&2
+    exit 1
+  fi
+fi
+
 log "Ejecutando terraform apply en vector-infraestructura (requiere confirmación)..."
 terraform -chdir="${VECTOR_INFRA_DIR}" apply -input=true
 restrict_state "${VECTOR_INFRA_DIR}"
