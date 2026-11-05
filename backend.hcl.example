@@ -4,5 +4,7 @@
 # Copiar a backend.hcl (no versionado) en la raíz del repositorio y sustituir
 # <ACCOUNT_ID> por la cuenta de tu Learner Lab. El bucket lo crea
 # scripts/bootstrap_tfstate_bucket.sh, que muestra el nombre exacto.
-# Contiene solo el nombre del bucket: nunca credenciales.
+# Contiene solo el nombre del bucket: nunca credenciales. Los deploy.sh
+# rechazan cualquier otra línea (key, region…): con -backend-config, una key
+# aquí sustituiría la de los tres stacks y todos usarían el mismo state.
 bucket = "rag-playas-tfstate-<ACCOUNT_ID>"

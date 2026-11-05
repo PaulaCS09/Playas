@@ -79,6 +79,16 @@ check_sg_drift() {
 
   [[ -z "${aws_id}" || "${aws_id}" == "None" ]] && return 0
 
+  # State remoto vacío (ALLOW_EMPTY_STATE=1) con el SG ya en AWS: el bucket o
+  # la key no son los correctos. No se sugiere state rm/import (se importaría
+  # en un state equivocado) ni se crean duplicados.
+  if [[ "${TF_REMOTE_STATE_EMPTY}" -eq 1 ]]; then
+    echo "✗ El state remoto está vacío pero ya existe el SG '${sg_name}' (${aws_id})." >&2
+    echo "  Revisar backend.hcl y la key antes de desplegar: no importar ni crear duplicados." >&2
+    SG_DRIFT=1
+    return 0
+  fi
+
   if [[ "${STATE_ADDRS_LOADED}" -eq 0 ]]; then
     STATE_ADDRS=$(tf_state_addresses "${INFRA_DIR}")
     STATE_ADDRS_LOADED=1

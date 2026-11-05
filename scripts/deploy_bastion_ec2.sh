@@ -24,6 +24,9 @@
 # Variables opcionales:
 #   KEY_FILE   Ruta al .pem (default: ~/vockey.pem)
 #   AWS_REGION Región AWS (default: us-east-1)
+#   ALLOW_EMPTY_STATE=1  Solo en el primer despliegue de una cuenta nueva (sin
+#              state en S3): se pasa a los deploy.sh del bastion para esta
+#              ejecución, sin exportarla. Sin ella, un state vacío los detiene.
 #
 # Cada terraform apply se ejecuta por `ssh -t` y pide confirmación humana.
 # Si el bastion ya tiene ~/playas, no se borra: se respaldan los states y se
@@ -93,6 +96,17 @@ normalize_ssh_cidr() {
   echo "${normalized[*]}/32"
 }
 
+# Primer despliegue en una cuenta nueva: opción explícita, solo "1". Se pasa a
+# los dos deploy.sh remotos como asignación del propio comando (no se exporta
+# en el bastion ni queda en ningún archivo).
+ALLOW_EMPTY_STATE="${ALLOW_EMPTY_STATE:-0}"
+case "${ALLOW_EMPTY_STATE}" in
+  0) REMOTE_DEPLOY_ENV="" ;;
+  1) REMOTE_DEPLOY_ENV="ALLOW_EMPTY_STATE=1 "
+     warn "ALLOW_EMPTY_STATE=1: los deploy.sh aceptarán un state remoto vacío solo en esta ejecución (primer despliegue de una cuenta nueva)." ;;
+  *) fail "ALLOW_EMPTY_STATE solo admite 1 (primer despliegue de una cuenta nueva) o no definirla." ;;
+esac
+
 BASTION_SSH_CIDR="${BASTION_SSH_CIDR:-}"
 [[ -n "${BASTION_SSH_CIDR}" ]] || fail "Define BASTION_SSH_CIDR con tu IP pública autorizada (formato a.b.c.d/32)."
 BASTION_SSH_CIDR="$(normalize_ssh_cidr "${BASTION_SSH_CIDR}")" \
@@ -109,14 +123,18 @@ OPENAI_API_KEY="$(grep -E '^OPENAI_API_KEY=' "${RAG_ENV}" | head -1 | cut -d'=' 
 [[ -n "${OPENAI_API_KEY}" ]] || fail "OPENAI_API_KEY no está configurada en ${RAG_ENV}."
 
 # Con backend S3 en los stacks, el bastion necesita backend.hcl (bucket del
-# state de esta cuenta). Se comprueba aquí, antes de crear nada en AWS.
+# state de esta cuenta). Se comprueba aquí, antes de crear nada en AWS, con la
+# misma validación que los deploy.sh: formato estricto, cuenta de las
+# credenciales y propiedad del bucket (solo lecturas).
 BACKEND_HCL="${REPO_DIR}/backend.hcl"
 if grep -qsE '^[[:space:]]*backend[[:space:]]+"s3"' \
   "${REPO_DIR}"/vector-infraestructura/*.tf "${REPO_DIR}"/rag/infrastructure/*.tf; then
   [[ -f "${BACKEND_HCL}" ]] \
     || fail "Falta ${BACKEND_HCL}: crear el bucket con scripts/bootstrap_tfstate_bucket.sh y copiar backend.hcl.example."
-  grep -qE '^[[:space:]]*bucket[[:space:]]*=[[:space:]]*"rag-playas-tfstate-[0-9]{12}"' "${BACKEND_HCL}" \
-    || fail "${BACKEND_HCL} debe contener bucket = \"rag-playas-tfstate-<account_id>\" (ver backend.hcl.example)."
+  # shellcheck source=lib/terraform_state.sh
+  source "${SCRIPT_DIR}/lib/terraform_state.sh"
+  tf_reject_backend_overrides
+  tf_verify_backend_config "${BACKEND_HCL}"
 fi
 
 ok "Prerrequisitos OK (key pair, OPENAI_API_KEY presentes)"
@@ -403,7 +421,7 @@ REMOTE_PATH='export PATH="${HOME}/.local/bin:${PATH}"'
 
 step "Desplegando infraestructura vectorial - README paso 1 (ChromaDB + Ollama)"
 ssh -t "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" \
-  "${REMOTE_PATH}; cd ~/playas && ./vector-infraestructura/scripts/deploy.sh"
+  "${REMOTE_PATH}; cd ~/playas && ${REMOTE_DEPLOY_ENV}./vector-infraestructura/scripts/deploy.sh"
 
 step "Configurando OPENAI_API_KEY en el bastion - README paso 2"
 ssh "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" "bash -s" <<'REMOTE_SCRIPT'
@@ -424,7 +442,7 @@ trap - EXIT
 
 step "Desplegando aplicación RAG en ECS Fargate - README paso 2"
 ssh -t "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" \
-  "${REMOTE_PATH}; cd ~/playas && sg docker -c ./rag/infrastructure/scripts/deploy.sh"
+  "${REMOTE_PATH}; cd ~/playas && sg docker -c '${REMOTE_DEPLOY_ENV}./rag/infrastructure/scripts/deploy.sh'"
 
 ALB_URL=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" \
   "terraform -chdir=\${HOME}/playas/rag/infrastructure output -raw alb_url" 2>/dev/null \
