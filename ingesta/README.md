@@ -48,9 +48,11 @@ el bucket (incluidas las versiones) y ejecutar `terraform plan -destroy` antes d
 
 `prevent_destroy` solo actúa sobre planes de Terraform: no impide borrar objetos
 o el bucket desde la consola o la CLI de AWS, ni `terraform state rm`. El state
-de este stack es local; si se pierde, el bucket queda fuera de Terraform y un
-`apply` posterior fallaría al intentar crearlo de nuevo (el nombre ya existe).
-Resguardar el state y no modificar el bucket fuera de Terraform.
+de este stack usa el backend S3 (`terraform -chdir=ingesta/infrastructure init
+-backend-config=../../backend.hcl`; ver "Terraform State remoto" en el README
+raíz). Si se pierde, el bucket queda fuera de Terraform y un `apply` posterior
+fallaría al intentar crearlo de nuevo (el nombre ya existe). Resguardar el state
+y no modificar el bucket fuera de Terraform.
 
 ## Contrato actual y límites operacionales
 

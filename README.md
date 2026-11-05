@@ -30,7 +30,7 @@ consultar [encendido y apagado](#apagarencender-el-cómputo-ahorro-de-costos).
 
 | Herramienta | Versión mínima |
 |---|---|
-| Terraform | 1.7 |
+| Terraform | 1.17.1 (`~> 1.17.1`) |
 | AWS CLI | 2.x |
 | Session Manager Plugin (AWS) | cualquiera |
 | Docker | 24.x |
@@ -71,6 +71,26 @@ session-manager-plugin   # debe responder "was installed successfully"
 
 ## Despliegue automático
 
+> **Primer despliegue en una cuenta de Learner Lab nueva** (sin state en S3):
+>
+> 1. Crear el bucket del state y `backend.hcl` (ver
+>    [Terraform State remoto](#terraform-state-remoto), paso 1).
+> 2. Ejecutar los dos `deploy.sh` (o el bastion) con `ALLOW_EMPTY_STATE=1`
+>    **solo en esa ejecución**, como prefijo del comando, sin exportarla:
+>
+>    ```bash
+>    ALLOW_EMPTY_STATE=1 ./vector-infraestructura/scripts/deploy.sh
+>    ALLOW_EMPTY_STATE=1 ./rag/infrastructure/scripts/deploy.sh
+>    # o, desde el bastion:
+>    ALLOW_EMPTY_STATE=1 BASTION_SSH_CIDR=<ip>/32 KEY_FILE=… ./scripts/deploy_bastion_ec2.sh
+>    ```
+>
+> Sin la variable, un state remoto vacío detiene el despliegue: en una cuenta
+> que ya tiene recursos indica un bucket o una key equivocados. No usarla si
+> existe un state local: ese caso es una migración o, fuera de la copia
+> autoritativa, un state antiguo que hay que apartar (ver
+> [Terraform State remoto](#terraform-state-remoto), paso 2).
+
 ### 1. Infraestructura vectorial (ChromaDB + Ollama en EC2)
 
 El script crea las EC2 con IP estática, actualiza las variables de entorno del proyecto con las IPs resultantes e importa los datos en ChromaDB:
@@ -82,9 +102,10 @@ El script crea las EC2 con IP estática, actualiza las variables de entorno del 
 Los scripts de despliegue requieren una terminal interactiva: `terraform apply`
 muestra el plan y espera confirmación humana (`--auto-approve` no está
 permitido, y el script se detiene si `TF_CLI_ARGS*` o `TF_INPUT` están
-definidas). Antes de cada apply copian el state local a `~/tfstate-backups/`
-(configurable con `TFSTATE_BACKUP_DIR`), fuera del clon, y dejan el state con
-permisos `600`.
+definidas). Antes de cada apply respaldan el state en `~/tfstate-backups/`
+(configurable con `TFSTATE_BACKUP_DIR`), fuera del clon y con permisos `600`:
+el archivo local o, con backend S3, `terraform state pull` (ver
+[Terraform State remoto](#terraform-state-remoto)).
 
 Al finalizar, `rag/.env` y `rag/infrastructure/terraform.tfvars` quedan actualizados con `CHROMA_HOST` y `OLLAMA_BASE_URL`.
 
@@ -156,6 +177,10 @@ Requisitos:
 - Key pair `vockey` ya creado en EC2 (estándar en AWS Academy) y su `.pem` descargado localmente
 - `rag/.env` con `OPENAI_API_KEY` configurada (se transfiere a la EC2 por stdin, nunca queda
   expuesta en logs ni en el script)
+- `backend.hcl` en la raíz del repositorio (bucket del state de tu cuenta; ver
+  [Terraform State remoto](#terraform-state-remoto)). Antes de crear el security group o la
+  EC2, el script valida en local `backend.hcl` y el bucket igual que los `deploy.sh`
+  (paso 3 de esa sección) y después lo copia al bastion.
 - `BASTION_SSH_CIDR` con la IP pública autorizada para SSH, con máscara `/32`. El script
   rechaza `0.0.0.0/0`. Si reutiliza el security group del bastion, se detiene cuando alguna
   regla que alcance el puerto 22/tcp (IPv4 o IPv6, protocolo `-1` o un rango de puertos)
@@ -209,7 +234,7 @@ vez de crear una nueva.
 
 ```bash
 cd vector-infraestructura
-terraform init
+terraform init -backend-config=../backend.hcl   # ver "Terraform State remoto"
 terraform apply
 
 # Ver las IPs asignadas
@@ -251,7 +276,7 @@ Inicializa Terraform, aplica la infraestructura, construye las imágenes y fuerz
 
 ```bash
 cd rag/infrastructure
-terraform init
+terraform init -backend-config=../../backend.hcl
 terraform apply
 
 ./scripts/push_images.sh
@@ -264,6 +289,146 @@ aws ecs update-service --cluster rag-playas-prod --service rag-playas-prod-front
 ```
 
 ---
+
+## Terraform State remoto
+
+Los tres stacks (`ingesta/infrastructure`, `vector-infraestructura`,
+`rag/infrastructure`) declaran `backend "s3"` con `use_lockfile = true` y una
+key fija por stack: `ingesta/terraform.tfstate` (`ingesta/infrastructure`),
+`vector-infraestructura/terraform.tfstate` y `rag-infrastructure/terraform.tfstate`
+(`rag/infrastructure`). Cada integrante usa **un
+bucket en su propia cuenta de Learner Lab**, `rag-playas-tfstate-<account_id>`
+(us-east-1), cuyo nombre va en `backend.hcl` en la raíz del repositorio (no
+versionado; ver `backend.hcl.example`). Terraform: `~> 1.17.1` en los stacks,
+1.17.1 en la CI y en el bastion.
+
+### 1. Crear el bucket (una vez por cuenta)
+
+```bash
+RAG_EXPECTED_AWS_ACCOUNT_ID=<12 dígitos> ./scripts/bootstrap_tfstate_bucket.sh
+cp backend.hcl.example backend.hcl   # poner el bucket que muestra el script
+RAG_EXPECTED_AWS_ACCOUNT_ID=<12 dígitos> ./scripts/bootstrap_tfstate_bucket.sh --verify-only
+```
+
+El script comprueba que las credenciales son de esa cuenta, pide confirmación
+y deja el bucket con BucketOwnerEnforced, Block Public Access completo,
+versionado, SSE-S3 y una política que deniega peticiones sin TLS. No borra
+nada ni configura expiración de versiones. `--verify-only` solo lee.
+
+### 2. Migrar el state local existente (manual, una sola persona por stack)
+
+Los scripts **nunca** migran: si el stack usa backend S3 y queda un
+`terraform.tfstate` local, `deploy.sh` se detiene. La migración la hace una
+persona, desde la copia autoritativa del state (normalmente el bastion), un
+stack cada vez y en este orden: `ingesta/infrastructure`,
+`vector-infraestructura`, `rag/infrastructure`. Cada paso requiere aprobación.
+
+0. Comprobar `backend.hcl` y el bucket: los `init` manuales no pasan por la
+   validación de los scripts, y una `key` en `backend.hcl` dejaría el state en
+   la key equivocada.
+
+   ```bash
+   grep -vE '^[[:space:]]*(#.*)?$' backend.hcl
+   # debe imprimir exactamente: bucket = "rag-playas-tfstate-<tu cuenta>"
+   RAG_EXPECTED_AWS_ACCOUNT_ID=<12 dígitos> ./scripts/bootstrap_tfstate_bucket.sh --verify-only
+   ```
+
+1. Congelar los applies de ese stack y respaldar el state local fuera del clon
+   (y una copia cifrada fuera de AWS). Anotar `lineage`, `serial` y
+   `terraform state list`.
+2. Desde una terminal interactiva (en el bastion, por `ssh -t`):
+   `terraform -chdir=<stack> init -migrate-state -backend-config=<raíz>/backend.hcl`
+   y responder `yes` a la copia. Nunca `-force-copy`.
+3. Comprobar: mismo `lineage`, `serial` igual (o +1), mismo `state list`,
+   `terraform plan` sin cambios y el objeto de la key del stack en S3.
+4. Mover (no borrar) el `terraform.tfstate*` local que quede a
+   `~/tfstate-backups/<stack>/pre-s3-<fecha>/` con permisos 600.
+
+Los demás clones de ese stack se inicializan una vez, tras repetir el paso 0,
+con `terraform -chdir=<stack> init -reconfigure -backend-config=<raíz>/backend.hcl`
+(no copia nada). Si uno de esos clones conserva un `terraform.tfstate` antiguo,
+**no migrarlo** (sobrescribiría el state de S3): moverlo antes fuera del clon,
+a `~/tfstate-backups/<stack>/pre-s3-<fecha>/` con permisos 600. Si un
+`deploy.sh` informa de un state local o de que `init` falló porque el clon
+estaba inicializado con otro backend, es este paso.
+
+### 3. Comportamiento de los scripts con backend S3
+
+- `deploy.sh` exige `backend.hcl` y ejecuta `init -input=false -backend-config=<raíz>/backend.hcl`.
+- Antes del `init` se detiene si están definidas `AWS_ENDPOINT_URL`,
+  `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL_STS`, `AWS_S3_ENDPOINT`,
+  `AWS_STS_ENDPOINT` o `TF_WORKSPACE`: redirigirían el backend o la
+  verificación de la cuenta, o cambiarían la key del state.
+- Comprueba que `backend.hcl` contiene **solo** la línea `bucket` (además de
+  comentarios): una `key` en ese archivo sustituiría la de los tres stacks, que
+  acabarían compartiendo el mismo state. Comprueba también con
+  `aws sts get-caller-identity` que el bucket es
+  `rag-playas-tfstate-<cuenta actual>` (y, si está definida, que la cuenta es
+  `RAG_EXPECTED_AWS_ACCOUNT_ID`), y con
+  `aws s3api head-bucket --expected-bucket-owner <cuenta>` (us-east-1) que el
+  bucket existe y pertenece a esa cuenta. Si algo no coincide, se detiene sin
+  llamar a Terraform. `deploy_bastion_ec2.sh` hace esta misma validación en
+  local antes de crear el security group o la EC2.
+- Antes de cada apply, `terraform state pull` se guarda en
+  `~/tfstate-backups/<stack>/<fecha>/remote.tfstate` (600). Si el pull falla
+  (backend o credenciales) el despliegue se detiene; si el state está vacío
+  también, salvo `ALLOW_EMPTY_STATE=1` para un stack nuevo. Terraform no
+  devuelve una salida vacía cuando la key no existe, sino un state vacío
+  (`"serial": 0`, `"lineage": ""`); los scripts tratan ambos casos igual.
+- Con `ALLOW_EMPTY_STATE=1`, el despliegue se detiene igualmente si detecta
+  recursos del stack ya existentes: las EC2 `rag-playas-chromadb`/`rag-playas-ollama`
+  en vector, o los security groups `rag-playas-prod-*` en rag (`check_sg_drift`).
+  Es una comprobación parcial: solo mira esos recursos y con los nombres por
+  defecto (no detecta, p. ej., EIP o security groups de vector sin sus EC2, ni
+  recursos de rag sin sus security groups). Ingesta se aplica a mano y no
+  tiene esta comprobación. Con un state vacío, revisar siempre en el plan que
+  no se proponga crear recursos que ya existen.
+- `check_sg_drift` (rag) lee `terraform state list` una vez: si falla, se
+  detiene sin sugerir `import`. Tampoco lo sugiere cuando el state remoto está
+  vacío (`ALLOW_EMPTY_STATE=1`) y los security groups existen: indica revisar
+  `backend.hcl` y la key, porque importar en un state vacío ocultaría un
+  bucket o una key equivocados.
+- Los respaldos siguen dentro de la cuenta del lab y en texto plano (600):
+  copiarlos cifrados fuera de AWS sigue siendo responsabilidad del integrante.
+- Solo se ejecutan a mano, nunca desde scripts: `-migrate-state`,
+  `-reconfigure`, `-force-copy`, `terraform state push` y
+  `terraform force-unlock`. Un test estático lo comprueba.
+- La CI valida con `init -backend=false`: no usa el bucket ni credenciales.
+
+### 4. Rollback de un stack migrado
+
+- Sin applies después de migrar: quitar el bloque `backend` en un cambio
+  revisado y `terraform init -migrate-state` hacia local; comprobar `lineage`
+  y `serial` contra S3.
+- Con applies después de migrar: igual, siempre con `-migrate-state` desde S3
+  (restaurar la copia previa dejaría recursos fuera del state).
+- Después, retirar el objeto de S3 (y cualquier `.tflock`) para no tener dos
+  fuentes de verdad.
+- Un lock huérfano (credenciales caducadas a mitad de un apply) se libera con
+  `terraform force-unlock <ID>` solo tras confirmar que no hay otro proceso.
+
+#### Recuperar una versión anterior del state
+
+El bucket tiene versionado: cada escritura del state conserva la anterior.
+Listar y descargar una versión solo lee:
+
+```bash
+BUCKET=rag-playas-tfstate-<cuenta>; KEY=<key del stack>   # p. ej. vector-infraestructura/terraform.tfstate
+aws s3api list-object-versions --bucket "$BUCKET" --prefix "$KEY" \
+  --expected-bucket-owner <cuenta> --region us-east-1 \
+  --query "Versions[?Key=='$KEY'].[VersionId,LastModified,Size]" --output table
+(umask 077; mkdir -p ~/tfstate-backups/<stack>; aws s3api get-object --bucket "$BUCKET" --key "$KEY" \
+  --version-id <VersionId> --expected-bucket-owner <cuenta> --region us-east-1 \
+  ~/tfstate-backups/<stack>/version-<VersionId>.tfstate)
+```
+
+El `--query` excluye el objeto `<key>.tflock`, que comparte el prefijo. El
+archivo descargado queda fuera del clon y con permisos 600. Restaurarlo (con
+`terraform state push` o copiando esa versión sobre la actual) es una
+operación manual que requiere aprobación, la hace una sola persona y solo con
+el lock libre (sin objeto `<key>.tflock`). `state push` rechaza un `serial`
+menor que el actual; no usar `-force` sin aprobación. Después, revisar
+`terraform plan`: los recursos creados tras esa versión quedarían fuera del state.
 
 ## Arquitectura desplegada
 

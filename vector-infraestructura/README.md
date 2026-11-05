@@ -13,7 +13,7 @@ Cada instancia recibe una **Elastic IP estática** que no cambia entre reinicios
 
 | Herramienta | Versión mínima | Verificar |
 |---|---|---|
-| Terraform | 1.7 | `terraform version` |
+| Terraform | 1.17.1 (`~> 1.17.1`) | `terraform version` |
 | AWS CLI | 2.x | `aws --version` |
 | Python + uv | cualquiera | `uv --version` |
 | curl | cualquiera | `curl --version` |
@@ -49,13 +49,15 @@ Desde la raíz del repositorio (`playas/`):
 
 El script requiere una terminal interactiva: `terraform apply` siempre pide
 confirmación humana y `--auto-approve` no está permitido. `terraform init` se
-ejecuta sin `-upgrade` para respetar `.terraform.lock.hcl`, y antes del apply el
-state local se copia a `~/tfstate-backups/` (configurable con `TFSTATE_BACKUP_DIR`).
+ejecuta sin `-upgrade` para respetar `.terraform.lock.hcl` y con
+`-backend-config=<raíz>/backend.hcl` (backend S3; ver "Terraform State remoto" en el
+README raíz). Antes del apply el state se respalda en `~/tfstate-backups/`
+(configurable con `TFSTATE_BACKUP_DIR`); si el respaldo falla, no hay apply.
 
 ### Qué hace el script
 
 ```
-0. terraform init           — sin -upgrade; copia el state a ~/tfstate-backups/
+0. terraform init           — backend S3, sin -upgrade; respalda el state en ~/tfstate-backups/
 1. terraform apply          — crea/actualiza las EC2 con sus Elastic IPs (pide confirmación)
 2. terraform output         — lee las IPs estáticas resultantes
 3. Actualiza rag/.env       — CHROMA_HOST y OLLAMA_BASE_URL
@@ -117,9 +119,10 @@ terraform apply
 Si prefieres ejecutar cada paso por separado:
 
 ```bash
-# 1. Inicializar Terraform (solo la primera vez)
+# 1. Inicializar Terraform (solo la primera vez; backend S3, ver
+#    "Terraform State remoto" en el README raíz)
 cd vector-infraestructura
-terraform init
+terraform init -backend-config=../backend.hcl
 
 # 2. Ver el plan
 terraform plan

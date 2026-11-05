@@ -159,10 +159,12 @@ def _install_fakes(bin_dir: Path) -> None:
 
 
 def _copy_script(src: Path, root: Path) -> Path:
-    dest = root / src.relative_to(REPO_ROOT)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dest)
-    return dest
+    # Los deploy.sh cargan la biblioteca compartida de scripts/lib/.
+    for path in (src, REPO_ROOT / "scripts" / "lib" / "terraform_state.sh"):
+        dest = root / path.relative_to(REPO_ROOT)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dest)
+    return root / src.relative_to(REPO_ROOT)
 
 
 def _run(script: Path, tmp_path: Path, *args: str) -> tuple[subprocess.CompletedProcess[str], str]:

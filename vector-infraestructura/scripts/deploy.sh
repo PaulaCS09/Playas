@@ -7,8 +7,9 @@
 #   ./scripts/deploy.sh
 #
 # terraform apply siempre pide confirmación humana: el script exige una
-# terminal interactiva y rechaza --auto-approve. Antes del apply copia el
-# state local a TFSTATE_BACKUP_DIR (default: ~/tfstate-backups), fuera del clon.
+# terminal interactiva y rechaza --auto-approve. Antes del apply respalda el
+# state (local o S3, ver scripts/lib/terraform_state.sh) en TFSTATE_BACKUP_DIR
+# (default: ~/tfstate-backups), fuera del clon.
 #
 # Archivos que actualiza:
 #   rag/.env                             — CHROMA_HOST y OLLAMA_BASE_URL (IP pública,
@@ -23,7 +24,10 @@ set -euo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 VECTOR_INFRA_DIR="${SCRIPT_DIR}/.."
+# shellcheck source=../../scripts/lib/terraform_state.sh
+source "${REPO_ROOT}/scripts/lib/terraform_state.sh"
 RAG_DIR="${SCRIPT_DIR}/../../rag"
 DATA_DIR="${SCRIPT_DIR}/../../data"
 RAG_ENV="${RAG_DIR}/.env"
@@ -59,37 +63,6 @@ for tf_var in TF_CLI_ARGS TF_CLI_ARGS_init TF_CLI_ARGS_plan TF_CLI_ARGS_apply TF
   fi
 done
 
-# backup_state <directorio_terraform> <nombre_stack>
-# Copia el state local (si existe) fuera del clon, con permisos 600, y deja el
-# state original también en 600: contiene los valores de las variables sensibles.
-backup_state() {
-  local tf_dir="$1" stack="$2" dest
-  if [[ -e "${tf_dir}/.terraform.tfstate.lock.info" ]]; then
-    echo "✗ Existe ${tf_dir}/.terraform.tfstate.lock.info: otro proceso de Terraform puede estar en curso." >&2
-    exit 1
-  fi
-  if [[ ! -f "${tf_dir}/terraform.tfstate" ]]; then
-    warn "No hay terraform.tfstate local en ${stack}; no hay nada que respaldar"
-    return 0
-  fi
-  dest="${TFSTATE_BACKUP_DIR:-${HOME}/tfstate-backups}/${stack}/$(date +%Y%m%d-%H%M%S)-$$"
-  (
-    umask 077
-    mkdir -p "${dest}"
-    cp -pL "${tf_dir}"/terraform.tfstate* "${dest}/"
-    chmod 600 "${dest}"/terraform.tfstate* "${tf_dir}"/terraform.tfstate*
-  )
-  ok "State respaldado en ${dest}"
-}
-
-# restrict_state <directorio_terraform>: deja el state escrito por apply en 600.
-restrict_state() {
-  local tf_dir="$1"
-  if compgen -G "${tf_dir}/terraform.tfstate*" > /dev/null; then
-    chmod 600 "${tf_dir}"/terraform.tfstate*
-  fi
-}
-
 # Sin valor por defecto: el acceso público transitorio a ChromaDB/Ollama debe
 # decidirse de forma explícita, para que un clon sin terraform.tfvars no reabra
 # 8000/11434 tras la fase 3 de la migración de red.
@@ -104,10 +77,27 @@ fi
 
 # ── 1. Terraform init + apply ─────────────────────────────────────────────────
 log "Inicializando Terraform en vector-infraestructura..."
-# Sin -upgrade: respeta las versiones fijadas en .terraform.lock.hcl.
-terraform -chdir="${VECTOR_INFRA_DIR}" init
+tf_init "${VECTOR_INFRA_DIR}" "${REPO_ROOT}"
 
 backup_state "${VECTOR_INFRA_DIR}" "vector-infraestructura"
+
+# Con el state remoto vacío (ALLOW_EMPTY_STATE=1) se crearían de nuevo todas
+# las EC2. Si ya existen en la cuenta, el bucket o la key no son los correctos:
+# se detiene en lugar de duplicarlas (consulta de solo lectura).
+if [[ "${TF_REMOTE_STATE_EMPTY}" -eq 1 ]]; then
+  if ! existing=$(aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=rag-playas-chromadb,rag-playas-ollama" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[].Instances[].InstanceId' --output text --region us-east-1); then
+    echo "✗ No se pudo comprobar si ya existen las EC2 de ChromaDB/Ollama." >&2
+    exit 1
+  fi
+  if [[ -n "${existing//[[:space:]]/}" && "${existing}" != "None" ]]; then
+    echo "✗ El state remoto está vacío pero ya existen EC2 de ChromaDB/Ollama (${existing})." >&2
+    echo "  Revisar backend.hcl y la key antes de desplegar: no se crean duplicados." >&2
+    exit 1
+  fi
+fi
 
 log "Ejecutando terraform apply en vector-infraestructura (requiere confirmación)..."
 terraform -chdir="${VECTOR_INFRA_DIR}" apply -input=true

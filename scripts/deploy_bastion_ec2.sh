@@ -24,6 +24,9 @@
 # Variables opcionales:
 #   KEY_FILE   Ruta al .pem (default: ~/vockey.pem)
 #   AWS_REGION Región AWS (default: us-east-1)
+#   ALLOW_EMPTY_STATE=1  Solo en el primer despliegue de una cuenta nueva (sin
+#              state en S3): se pasa a los deploy.sh del bastion para esta
+#              ejecución, sin exportarla. Sin ella, un state vacío los detiene.
 #
 # Cada terraform apply se ejecuta por `ssh -t` y pide confirmación humana.
 # Si el bastion ya tiene ~/playas, no se borra: se respaldan los states y se
@@ -39,6 +42,11 @@ INSTANCE_TYPE="m4.large"
 VOLUME_SIZE_GB=50
 KEY_NAME="vockey"
 KEY_FILE="${KEY_FILE:-${HOME}/vockey.pem}"
+# Versión de Terraform común a stacks (~> 1.17.1), CI y bastion. El hash es el
+# de terraform_1.17.1_linux_amd64.zip en releases.hashicorp.com (SHA256SUMS);
+# cambiarlo solo junto con la versión, en un PR revisado.
+TERRAFORM_VERSION="1.17.1"
+TERRAFORM_SHA256="4638628058e71a55212b1c563712eac03b902128f40740f3dc8174df12135061"
 REGION="${AWS_REGION:-us-east-1}"
 # LabRole es el rol preexistente en AWS Academy (ver rag/infrastructure/iam.tf);
 # LabInstanceProfile es el instance profile estándar que lo expone a las EC2.
@@ -88,6 +96,17 @@ normalize_ssh_cidr() {
   echo "${normalized[*]}/32"
 }
 
+# Primer despliegue en una cuenta nueva: opción explícita, solo "1". Se pasa a
+# los dos deploy.sh remotos como asignación del propio comando (no se exporta
+# en el bastion ni queda en ningún archivo).
+ALLOW_EMPTY_STATE="${ALLOW_EMPTY_STATE:-0}"
+case "${ALLOW_EMPTY_STATE}" in
+  0) REMOTE_DEPLOY_ENV="" ;;
+  1) REMOTE_DEPLOY_ENV="ALLOW_EMPTY_STATE=1 "
+     warn "ALLOW_EMPTY_STATE=1: los deploy.sh aceptarán un state remoto vacío solo en esta ejecución (primer despliegue de una cuenta nueva)." ;;
+  *) fail "ALLOW_EMPTY_STATE solo admite 1 (primer despliegue de una cuenta nueva) o no definirla." ;;
+esac
+
 BASTION_SSH_CIDR="${BASTION_SSH_CIDR:-}"
 [[ -n "${BASTION_SSH_CIDR}" ]] || fail "Define BASTION_SSH_CIDR con tu IP pública autorizada (formato a.b.c.d/32)."
 BASTION_SSH_CIDR="$(normalize_ssh_cidr "${BASTION_SSH_CIDR}")" \
@@ -102,6 +121,21 @@ RAG_ENV="${REPO_DIR}/rag/.env"
 
 OPENAI_API_KEY="$(grep -E '^OPENAI_API_KEY=' "${RAG_ENV}" | head -1 | cut -d'=' -f2-)"
 [[ -n "${OPENAI_API_KEY}" ]] || fail "OPENAI_API_KEY no está configurada en ${RAG_ENV}."
+
+# Con backend S3 en los stacks, el bastion necesita backend.hcl (bucket del
+# state de esta cuenta). Se comprueba aquí, antes de crear nada en AWS, con la
+# misma validación que los deploy.sh: formato estricto, cuenta de las
+# credenciales y propiedad del bucket (solo lecturas).
+BACKEND_HCL="${REPO_DIR}/backend.hcl"
+if grep -qsE '^[[:space:]]*backend[[:space:]]+"s3"' \
+  "${REPO_DIR}"/vector-infraestructura/*.tf "${REPO_DIR}"/rag/infrastructure/*.tf; then
+  [[ -f "${BACKEND_HCL}" ]] \
+    || fail "Falta ${BACKEND_HCL}: crear el bucket con scripts/bootstrap_tfstate_bucket.sh y copiar backend.hcl.example."
+  # shellcheck source=lib/terraform_state.sh
+  source "${SCRIPT_DIR}/lib/terraform_state.sh"
+  tf_reject_backend_overrides
+  tf_verify_backend_config "${BACKEND_HCL}"
+fi
 
 ok "Prerrequisitos OK (key pair, OPENAI_API_KEY presentes)"
 
@@ -257,7 +291,8 @@ fi
 BOOTSTRAP_ONLY="${BOOTSTRAP_ONLY:-0}"
 step "Ejecutando bootstrap remoto en la EC2 (esto tarda varios minutos)"
 
-ssh "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" "REPO_URL='${REPO_URL}' bash -s" <<'REMOTE_SCRIPT'
+ssh "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" \
+  "REPO_URL='${REPO_URL}' TERRAFORM_VERSION='${TERRAFORM_VERSION}' TERRAFORM_SHA256='${TERRAFORM_SHA256}' bash -s" <<'REMOTE_SCRIPT'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
@@ -297,13 +332,25 @@ if ! command -v aws >/dev/null 2>&1; then
 fi
 ok "$(aws --version)"
 
-step "Instalando Terraform"
-wget -qO - https://apt.releases.hashicorp.com/gpg | sudo gpg --batch --yes --no-tty --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
-  | sudo tee /etc/apt/sources.list.d/hashicorp.list >/dev/null
-"${APT_ENV[@]}" apt-get update -y
-"${APT_ENV[@]}" apt-get install -y terraform
-ok "$(terraform -version | head -1)"
+step "Instalando Terraform ${TERRAFORM_VERSION} (zip oficial verificado con SHA256)"
+# Versión fija y verificada: apt-get upgrade no la cambia (no se instala desde apt).
+"${APT_ENV[@]}" apt-get install -y unzip
+if [[ -x /usr/local/bin/terraform ]] \
+  && /usr/local/bin/terraform version | head -1 | grep -qx "Terraform v${TERRAFORM_VERSION}"; then
+  ok "Terraform ${TERRAFORM_VERSION} ya instalado"
+else
+  tf_tmp="$(mktemp -d)"
+  curl -fsSL "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
+    -o "${tf_tmp}/terraform.zip"
+  echo "${TERRAFORM_SHA256}  ${tf_tmp}/terraform.zip" | sha256sum -c -
+  unzip -q -o "${tf_tmp}/terraform.zip" terraform -d "${tf_tmp}"
+  sudo install -m 0755 "${tf_tmp}/terraform" /usr/local/bin/terraform
+  rm -rf "${tf_tmp}"
+fi
+hash -r
+[[ "$(command -v terraform)" == "/usr/local/bin/terraform" ]] \
+  || { echo "✗ El terraform del PATH no es /usr/local/bin/terraform (revisar instalaciones previas)." >&2; exit 1; }
+ok "$(terraform version | head -1)"
 
 step "Instalando uv"
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -356,6 +403,13 @@ mkdir -p ~/playas/data
 ok "Bootstrap completado"
 REMOTE_SCRIPT
 
+# backend.hcl (solo el nombre del bucket, sin credenciales) al clon del bastion.
+# Por stdin, sin heredoc: los deploy.sh lo leen de ~/playas/backend.hcl.
+if [[ -f "${BACKEND_HCL}" ]]; then
+  ssh "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" 'umask 077; cat > ~/playas/backend.hcl' < "${BACKEND_HCL}"
+  ok "backend.hcl copiado al bastion"
+fi
+
 if [[ "${BOOTSTRAP_ONLY}" == "1" ]]; then
   echo ""
   echo -e "${bold}BOOTSTRAP_ONLY=1: deteniendo antes de los despliegues de Terraform.${reset}"
@@ -367,7 +421,7 @@ REMOTE_PATH='export PATH="${HOME}/.local/bin:${PATH}"'
 
 step "Desplegando infraestructura vectorial - README paso 1 (ChromaDB + Ollama)"
 ssh -t "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" \
-  "${REMOTE_PATH}; cd ~/playas && ./vector-infraestructura/scripts/deploy.sh"
+  "${REMOTE_PATH}; cd ~/playas && ${REMOTE_DEPLOY_ENV}./vector-infraestructura/scripts/deploy.sh"
 
 step "Configurando OPENAI_API_KEY en el bastion - README paso 2"
 ssh "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" "bash -s" <<'REMOTE_SCRIPT'
@@ -388,7 +442,7 @@ trap - EXIT
 
 step "Desplegando aplicación RAG en ECS Fargate - README paso 2"
 ssh -t "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" \
-  "${REMOTE_PATH}; cd ~/playas && sg docker -c ./rag/infrastructure/scripts/deploy.sh"
+  "${REMOTE_PATH}; cd ~/playas && sg docker -c '${REMOTE_DEPLOY_ENV}./rag/infrastructure/scripts/deploy.sh'"
 
 ALB_URL=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${PUBLIC_IP}" \
   "terraform -chdir=\${HOME}/playas/rag/infrastructure output -raw alb_url" 2>/dev/null \
