@@ -7,8 +7,9 @@
 #   ./scripts/deploy.sh
 #
 # terraform apply siempre pide confirmación humana: el script exige una
-# terminal interactiva y rechaza --auto-approve. Antes del apply copia el
-# state local a TFSTATE_BACKUP_DIR (default: ~/tfstate-backups), fuera del clon.
+# terminal interactiva y rechaza --auto-approve. Antes del apply respalda el
+# state (local o S3, ver scripts/lib/terraform_state.sh) en TFSTATE_BACKUP_DIR
+# (default: ~/tfstate-backups), fuera del clon.
 #
 # Requisitos:
 #   - rag/infrastructure/terraform.tfvars con todas las variables configuradas
@@ -18,7 +19,10 @@ set -euo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 INFRA_DIR="${SCRIPT_DIR}/.."
+# shellcheck source=../../../scripts/lib/terraform_state.sh
+source "${REPO_ROOT}/scripts/lib/terraform_state.sh"
 REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 # Coincide con local.name_prefix = var.project + "-" + var.environment (defaults)
 NAME_PREFIX="rag-playas-prod"
@@ -50,56 +54,44 @@ for tf_var in TF_CLI_ARGS TF_CLI_ARGS_init TF_CLI_ARGS_plan TF_CLI_ARGS_apply TF
   fi
 done
 
-# backup_state <directorio_terraform> <nombre_stack>
-# Copia el state local (si existe) fuera del clon, con permisos 600, y deja el
-# state original también en 600: contiene los valores de las variables sensibles.
-backup_state() {
-  local tf_dir="$1" stack="$2" dest
-  if [[ -e "${tf_dir}/.terraform.tfstate.lock.info" ]]; then
-    echo "✗ Existe ${tf_dir}/.terraform.tfstate.lock.info: otro proceso de Terraform puede estar en curso." >&2
-    exit 1
-  fi
-  if [[ ! -f "${tf_dir}/terraform.tfstate" ]]; then
-    warn "No hay terraform.tfstate local en ${stack}; no hay nada que respaldar"
-    return 0
-  fi
-  dest="${TFSTATE_BACKUP_DIR:-${HOME}/tfstate-backups}/${stack}/$(date +%Y%m%d-%H%M%S)-$$"
-  (
-    umask 077
-    mkdir -p "${dest}"
-    cp -pL "${tf_dir}"/terraform.tfstate* "${dest}/"
-    chmod 600 "${dest}"/terraform.tfstate* "${tf_dir}"/terraform.tfstate*
-  )
-  ok "State respaldado en ${dest}"
-}
-
-# restrict_state <directorio_terraform>: deja el state escrito por apply en 600.
-restrict_state() {
-  local tf_dir="$1"
-  if compgen -G "${tf_dir}/terraform.tfstate*" > /dev/null; then
-    chmod 600 "${tf_dir}"/terraform.tfstate*
-  fi
-}
-
 # ── Verificación de security groups ───────────────────────────────────────────
 # Detecta un SG que existe en AWS con un ID distinto al del state (p. ej., tras
 # un destroy parcial). No modifica el state: se detiene e indica los comandos
 # para que una persona los revise y ejecute manualmente.
+#
+# Distingue "el recurso no está en el state" de un error del backend o de
+# credenciales: la lista de direcciones se lee una sola vez y debe poder
+# leerse (si falla, se detiene sin sugerir import). Si el recurso está en la
+# lista, `state show` también debe funcionar.
 SG_DRIFT=0
+STATE_ADDRS_LOADED=0
+STATE_ADDRS=""
 check_sg_drift() {
   local resource="$1" sg_name="$2" vpc_id="$3"
-  local aws_id state_id
+  local aws_id state_id="" shown
 
-  aws_id=$(aws ec2 describe-security-groups \
+  if ! aws_id=$(aws ec2 describe-security-groups \
     --filters "Name=vpc-id,Values=${vpc_id}" "Name=group-name,Values=${sg_name}" \
-    --query 'SecurityGroups[0].GroupId' --output text --region "${REGION}" 2>/dev/null)
+    --query 'SecurityGroups[0].GroupId' --output text --region "${REGION}"); then
+    echo "✗ No se pudieron consultar los security groups en AWS (credenciales o permisos)." >&2
+    exit 1
+  fi
 
   [[ -z "${aws_id}" || "${aws_id}" == "None" ]] && return 0
 
-  # Lectura del state (solo lectura). Si el recurso no está en el state,
-  # state_id queda vacío en lugar de abortar el script por pipefail.
-  state_id=$( { terraform -chdir="${INFRA_DIR}" state show -no-color "${resource}" 2>/dev/null \
-    | grep -E '^\s+id\s+=' | sed 's/.*"\(.*\)"/\1/'; } || true)
+  if [[ "${STATE_ADDRS_LOADED}" -eq 0 ]]; then
+    STATE_ADDRS=$(tf_state_addresses "${INFRA_DIR}")
+    STATE_ADDRS_LOADED=1
+  fi
+
+  # -F: el punto de la dirección no es comodín; -x: sin coincidencias parciales.
+  if grep -Fxq -- "${resource}" <<< "${STATE_ADDRS}"; then
+    if ! shown=$(terraform -chdir="${INFRA_DIR}" state show -no-color "${resource}"); then
+      echo "✗ terraform state show ${resource} falló aunque el recurso está en el state." >&2
+      exit 1
+    fi
+    state_id=$(sed -nE 's/^[[:space:]]+id[[:space:]]+=[[:space:]]+"([^"]*)".*/\1/p' <<< "${shown}" | head -1)
+  fi
 
   [[ "${state_id}" == "${aws_id}" ]] && return 0
 
@@ -112,8 +104,7 @@ check_sg_drift() {
 
 # ── 1. Terraform init ─────────────────────────────────────────────────────────
 log "Inicializando Terraform en rag/infrastructure..."
-# Sin -upgrade: respeta las versiones fijadas en .terraform.lock.hcl.
-terraform -chdir="${INFRA_DIR}" init
+tf_init "${INFRA_DIR}" "${REPO_ROOT}"
 
 # Respaldo antes de verificar los SG: si hay que corregir el state a mano,
 # ya existe una copia.

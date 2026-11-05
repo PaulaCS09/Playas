@@ -1,0 +1,8 @@
+# Configuración del backend S3 del Terraform State, compartida por los tres
+# stacks (la key de cada stack está fija en su terraform.tf).
+#
+# Copiar a backend.hcl (no versionado) en la raíz del repositorio y sustituir
+# <ACCOUNT_ID> por la cuenta de tu Learner Lab. El bucket lo crea
+# scripts/bootstrap_tfstate_bucket.sh, que muestra el nombre exacto.
+# Contiene solo el nombre del bucket: nunca credenciales.
+bucket = "rag-playas-tfstate-<ACCOUNT_ID>"

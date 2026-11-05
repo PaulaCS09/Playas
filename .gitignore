@@ -70,9 +70,15 @@ dist/
 
 # 11) Terraform state
 *tfstate*
+# Excepciones explícitas: código del bootstrap del bucket del state (no son states).
+!scripts/bootstrap_tfstate_bucket.sh
+!rag/tests/unit/test_bootstrap_tfstate_bucket.py
 .terraform/
 *.tfvars
 !*.tfvars.example
+# Configuración local del backend S3 (bucket de la cuenta). No afecta a
+# .terraform.lock.hcl, que sí se versiona.
+backend.hcl
 
 # 12) Claude
 settings.local.json
