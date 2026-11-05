@@ -13,7 +13,7 @@ pipeline de datos, provisionado en `../../ingesta/infrastructure/`.
 
 ## Requisitos previos
 
-- Terraform ≥ 1.7, AWS CLI 2.x, credenciales AWS con permisos para ECS/ECR/ALB/EFS/IAM/EC2.
+- Terraform 1.17.1 (`~> 1.17.1`), AWS CLI 2.x, credenciales AWS con permisos para ECS/ECR/ALB/EFS/IAM/EC2.
 - ChromaDB y Ollama ya desplegados (ver `../../vector-infraestructura/`).
 - `terraform.tfvars` (copiar de `terraform.tfvars.example`) con, como mínimo,
   `postgres_password`, `jwt_secret_key`, `chroma_host`, `ollama_base_url`, y
@@ -48,7 +48,7 @@ Postgres corre en la misma tarea Fargate que el backend.
 
 | Script | Qué hace |
 |---|---|
-| `deploy.sh` | Inicializa Terraform (sin `-upgrade`), respalda el state local en `~/tfstate-backups/`, aplica la infraestructura con confirmación humana, construye y sube las imágenes, fuerza el redespliegue de los servicios ECS. Requiere una terminal interactiva, `terraform.tfvars` completo y credenciales AWS en el entorno. No admite `--auto-approve` y no modifica el state si detecta security groups desalineados: se detiene e indica los comandos manuales. |
+| `deploy.sh` | Inicializa Terraform (backend S3 con `<raíz>/backend.hcl`, sin `-upgrade`), respalda el state en `~/tfstate-backups/` (`state pull`; si falla, se detiene), aplica la infraestructura con confirmación humana, construye y sube las imágenes, fuerza el redespliegue de los servicios ECS. Requiere una terminal interactiva, `terraform.tfvars` completo y credenciales AWS en el entorno. No admite `--auto-approve` y no modifica el state si detecta security groups desalineados: se detiene e indica los comandos manuales. |
 | `push_images.sh [TAG]` | Construye las imágenes de backend/frontend y las sube a los repositorios ECR (lee las URLs desde los outputs de Terraform). Tag por defecto: `latest`. |
 | `start.sh` | Enciende **todo** el cómputo de la aplicación: primero las EC2 de ChromaDB y Ollama (descubiertas por tag, sin Terraform), verificadas por HTTP; luego, solo si responden, los servicios ECS `app` y `frontend`. No termina hasta comprobar por HTTP que el backend (`/api/ready`) y el frontend responden — ver detalle abajo. |
 | `stop.sh` | Apaga **todo** el cómputo en el orden inverso: primero ECS (confirmando, con una sola consulta agregada, que AMBOS servicios quedaron simultáneamente en `desired=running=pending=0`), y solo entonces las EC2 de ChromaDB/Ollama. No depende del ALB ni de `curl` en ningún punto. Los datos de Postgres (EFS) y de ChromaDB/Ollama (EBS) se conservan. |
@@ -142,7 +142,7 @@ solos** — son responsabilidad de quien los ejecuta:
 ```bash
 cd rag/infrastructure
 cp terraform.tfvars.example terraform.tfvars   # completar con valores reales
-terraform init
+terraform init -backend-config=../../backend.hcl   # ver "Terraform State remoto" en el README raíz
 terraform plan
 terraform apply
 
@@ -165,7 +165,7 @@ el script respalda el state, se detiene sin modificarlo e imprime los comandos
 
 1. Confirmar en la consola o con `aws ec2 describe-security-groups` que el SG
    indicado es el que debe gestionar Terraform.
-2. Comprobar que existe el respaldo en `~/tfstate-backups/rag-infrastructure/`.
+2. Comprobar que existe el respaldo en `~/tfstate-backups/rag-infrastructure/` (`remote.tfstate` con backend S3).
 3. Ejecutar manualmente los comandos impresos.
 4. Volver a lanzar `./scripts/deploy.sh` y revisar el plan antes de confirmar.
 

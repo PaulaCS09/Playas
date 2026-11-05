@@ -31,14 +31,23 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 VECTOR_DEPLOY = REPO_ROOT / "vector-infraestructura" / "scripts" / "deploy.sh"
 RAG_DEPLOY = REPO_ROOT / "rag" / "infrastructure" / "scripts" / "deploy.sh"
 BASTION = REPO_ROOT / "scripts" / "deploy_bastion_ec2.sh"
+STATE_LIB = REPO_ROOT / "scripts" / "lib" / "terraform_state.sh"
+BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap_tfstate_bucket.sh"
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="requiere bash")
 
 FAKE_TERRAFORM = """#!/usr/bin/env bash
 echo "terraform $*" >> "${CALL_LOG}"
 case "$*" in
-  *" init"*) exit 0 ;;
+  *" init"*) [[ -n "${FAKE_INIT_FAIL:-}" ]] && exit 1; exit 0 ;;
+  *" state pull"*)
+    [[ -n "${FAKE_STATE_PULL_FAIL:-}" ]] && { echo "Error: AccessDenied" >&2; exit 1; }
+    printf '%s' "${FAKE_STATE_PULL:-}" ;;
+  *" state list"*)
+    [[ -n "${FAKE_STATE_LIST_FAIL:-}" ]] && { echo "Error: ExpiredToken" >&2; exit 1; }
+    printf '%b' "${FAKE_STATE_LIST:-}" ;;
   *" state show"*)
+    [[ -n "${FAKE_STATE_SHOW_FAIL:-}" ]] && exit 1
     if [[ -n "${FAKE_STATE_SG_ID:-}" ]]; then echo "    id = \\"${FAKE_STATE_SG_ID}\\""; exit 0; fi
     exit 1 ;;
   *" apply"*) exit 1 ;;  # simula que la persona rechaza el plan
@@ -87,11 +96,13 @@ def _install_fakes(bin_dir: Path) -> None:
 
 
 def _copy_script(src: Path, root: Path) -> Path:
-    """Copia el script a la misma ruta relativa dentro de ``root``."""
-    dest = root / src.relative_to(REPO_ROOT)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dest)
-    return dest
+    """Copia el script (y la biblioteca compartida que cargan los deploy.sh) a
+    la misma ruta relativa dentro de ``root``."""
+    for path in (src, STATE_LIB):
+        dest = root / path.relative_to(REPO_ROOT)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dest)
+    return root / src.relative_to(REPO_ROOT)
 
 
 def _run(
@@ -138,6 +149,8 @@ def _run(
             os.close(stdin_master)
     return result, call_log.read_text().splitlines()
 
+
+ALL_SGS = "\\n".join(f"aws_security_group.{name}" for name in ("alb", "app", "efs", "frontend"))
 
 STACK_SCRIPTS = [
     pytest.param(VECTOR_DEPLOY, "vector-infraestructura", id="vector"),
@@ -296,18 +309,27 @@ def test_stack_script_stops_when_state_is_locked(script: Path, stack: str, tmp_p
 
 
 @pytest.mark.parametrize(
-    "state_sg_id",
-    [pytest.param("sg-en-state", id="id-distinto"), pytest.param("", id="ausente-en-state")],
+    ("state_sg_id", "state_list"),
+    [
+        pytest.param("sg-en-state", ALL_SGS, id="id-distinto"),
+        pytest.param("", "", id="ausente-en-state"),
+        # Una dirección que solo comparte prefijo no cuenta como presente.
+        pytest.param("", "aws_security_group.alb_x\\naws_security_group_app", id="prefijo"),
+    ],
 )
 def test_rag_deploy_stops_on_sg_drift_without_touching_state(
-    state_sg_id: str, tmp_path: Path
+    state_sg_id: str, state_list: str, tmp_path: Path
 ) -> None:
     copy = _copy_script(RAG_DEPLOY, tmp_path / "repo")
     (copy.parent.parent / "terraform.tfstate").write_text('{"serial": 3}')
     result, calls = _run(
         copy,
         tmp_path,
-        env_extra={"FAKE_AWS_SG_ID": "sg-en-aws", "FAKE_STATE_SG_ID": state_sg_id},
+        env_extra={
+            "FAKE_AWS_SG_ID": "sg-en-aws",
+            "FAKE_STATE_SG_ID": state_sg_id,
+            "FAKE_STATE_LIST": state_list,
+        },
     )
     assert result.returncode != 0
     assert "Despliegue detenido sin cambios" in result.stderr
@@ -457,3 +479,250 @@ def test_bastion_new_sg_announces_rule_before_creating_it(tmp_path: Path) -> Non
     authorize = [c for c in calls if "authorize-security-group-ingress" in c]
     assert len(authorize) == 1 and "--cidr 203.0.113.10/32" in authorize[0]
     _assert_rule_announced_before_write(result.stdout, "sg-nuevo", "203.0.113.10/32")
+
+
+# ---------------------------------------------------------------------------
+# Backend S3: inicialización y respaldo sin fallos silenciosos
+# ---------------------------------------------------------------------------
+
+S3_BACKEND_TF = """terraform {
+  backend "s3" {
+    key          = "stack/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
+"""
+
+
+def _s3_stack(script: Path, tmp_path: Path, backend_hcl: bool = True) -> tuple[Path, Path, Path]:
+    """Copia el deploy.sh a un repo temporal cuyo stack declara backend "s3"."""
+    repo = tmp_path / "repo"
+    copy = _copy_script(script, repo)
+    tf_dir = copy.parent.parent
+    (tf_dir / "terraform.tf").write_text(S3_BACKEND_TF)
+    backend = repo / "backend.hcl"
+    if backend_hcl:
+        backend.write_text('bucket = "rag-playas-tfstate-000000000000"\n')
+    return copy, tf_dir, backend
+
+
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_s3_backend_requires_backend_hcl(script: Path, stack: str, tmp_path: Path) -> None:
+    copy, _, backend = _s3_stack(script, tmp_path, backend_hcl=False)
+    result, calls = _run(copy, tmp_path)
+    assert result.returncode != 0
+    assert str(backend) in result.stderr
+    assert not any(c.startswith("terraform") for c in calls)
+
+
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_s3_backend_refuses_leftover_local_state(script: Path, stack: str, tmp_path: Path) -> None:
+    """Un state local junto al backend S3 serían dos fuentes de verdad: no se
+    migra automáticamente."""
+    copy, tf_dir, _ = _s3_stack(script, tmp_path)
+    (tf_dir / "terraform.tfstate").write_text('{"serial": 9}')
+    result, calls = _run(copy, tmp_path)
+    assert result.returncode != 0
+    assert "No se migra automáticamente" in result.stderr
+    assert not any(c.startswith("terraform") for c in calls)
+
+
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_s3_backend_init_uses_backend_config_and_reports_failures(
+    script: Path, stack: str, tmp_path: Path
+) -> None:
+    copy, _, backend = _s3_stack(script, tmp_path)
+    result, calls = _run(copy, tmp_path, env_extra={"FAKE_INIT_FAIL": "1"})
+    assert result.returncode != 0
+    assert "terraform init falló con el backend S3" in result.stderr
+    init_calls = [c for c in calls if " init" in c]
+    assert len(init_calls) == 1
+    assert f"-backend-config={backend}" in init_calls[0]
+    # Ninguna pregunta de migración puede contestarse dentro del script.
+    assert "-input=false" in init_calls[0].split()
+    for forbidden in ("-migrate-state", "-reconfigure", "-force-copy", "-upgrade"):
+        assert forbidden not in init_calls[0]
+    assert not any(" apply" in c for c in calls)
+
+
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_s3_backend_backup_stops_when_state_pull_fails(
+    script: Path, stack: str, tmp_path: Path
+) -> None:
+    copy, _, _ = _s3_stack(script, tmp_path)
+    result, calls = _run(copy, tmp_path, env_extra={"FAKE_STATE_PULL_FAIL": "1"})
+    assert result.returncode != 0
+    assert "state pull falló" in result.stderr
+    assert not any(" apply" in c for c in calls)
+    assert not list((tmp_path / "backups").rglob("*.partial"))
+
+
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_s3_backend_empty_state_needs_explicit_opt_in(
+    script: Path, stack: str, tmp_path: Path
+) -> None:
+    copy, _, _ = _s3_stack(script, tmp_path)
+    result, calls = _run(copy, tmp_path)
+    assert result.returncode != 0
+    assert "ALLOW_EMPTY_STATE=1" in result.stderr
+    assert not any(" apply" in c for c in calls)
+
+    result, calls = _run(copy, tmp_path, env_extra={"ALLOW_EMPTY_STATE": "1"})
+    assert "stack nuevo" in result.stdout
+    assert any(" apply" in c and "-auto-approve" not in c for c in calls)
+
+
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_s3_backend_backs_up_remote_state_before_apply(
+    script: Path, stack: str, tmp_path: Path
+) -> None:
+    copy, _, _ = _s3_stack(script, tmp_path)
+    remote_state = '{"version": 4, "serial": 12, "lineage": "abc"}'
+    result, calls = _run(
+        copy, tmp_path, env_extra={"FAKE_STATE_PULL": remote_state, "FAKE_STATE_LIST": ""}
+    )
+    pulls = [i for i, c in enumerate(calls) if " state pull" in c]
+    applies = [i for i, c in enumerate(calls) if " apply" in c]
+    assert pulls and applies and pulls[0] < applies[0]
+    backups = list((tmp_path / "backups" / stack).glob("*/remote.tfstate"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == remote_state
+    assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+    assert stat.S_IMODE(backups[0].parent.stat().st_mode) == 0o700
+
+
+# ---------------------------------------------------------------------------
+# check_sg_drift: un error del backend nunca se toma como "state vacío"
+# ---------------------------------------------------------------------------
+
+
+def test_rag_drift_check_stops_when_state_list_fails(tmp_path: Path) -> None:
+    copy = _copy_script(RAG_DEPLOY, tmp_path / "repo")
+    (copy.parent.parent / "terraform.tfstate").write_text('{"serial": 3}')
+    result, calls = _run(
+        copy, tmp_path, env_extra={"FAKE_AWS_SG_ID": "sg-en-aws", "FAKE_STATE_LIST_FAIL": "1"}
+    )
+    assert result.returncode != 0
+    assert "state list falló" in result.stderr
+    assert "import" not in result.stdout  # sin sugerencia de import engañosa
+    assert not any(" apply" in c for c in calls)
+
+
+def test_rag_drift_check_stops_when_listed_resource_cannot_be_shown(tmp_path: Path) -> None:
+    copy = _copy_script(RAG_DEPLOY, tmp_path / "repo")
+    (copy.parent.parent / "terraform.tfstate").write_text('{"serial": 3}')
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={
+            "FAKE_AWS_SG_ID": "sg-en-aws",
+            "FAKE_STATE_LIST": ALL_SGS,
+            "FAKE_STATE_SHOW_FAIL": "1",
+        },
+    )
+    assert result.returncode != 0
+    assert "state show aws_security_group.alb falló" in result.stderr
+    assert not any(" apply" in c for c in calls)
+
+
+def test_rag_drift_check_passes_when_ids_match(tmp_path: Path) -> None:
+    copy = _copy_script(RAG_DEPLOY, tmp_path / "repo")
+    (copy.parent.parent / "terraform.tfstate").write_text('{"serial": 3}')
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={
+            "FAKE_AWS_SG_ID": "sg-igual",
+            "FAKE_STATE_SG_ID": "sg-igual",
+            "FAKE_STATE_LIST": ALL_SGS,
+        },
+    )
+    assert "Despliegue detenido" not in result.stderr
+    assert sum(" state list" in c for c in calls) == 1  # se lee una sola vez
+    assert any(" apply" in c for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# Operaciones de state que solo se hacen a mano
+# ---------------------------------------------------------------------------
+
+_FORBIDDEN_IN_SCRIPTS = (
+    "-force-copy",
+    "-migrate-state",
+    "-reconfigure",
+    "state push",
+    "force-unlock",
+)
+_MESSAGE_CMDS = re.compile(r"^\s*(echo|printf|log|ok|warn|fail|tf_fail|step)\b")
+
+
+def _all_shell_scripts() -> list[Path]:
+    return sorted(
+        p
+        for p in REPO_ROOT.rglob("*.sh")
+        if not {".git", ".venv", "node_modules", ".terraform"}.intersection(p.parts)
+    )
+
+
+def test_scripts_never_run_manual_only_state_operations() -> None:
+    scripts = _all_shell_scripts()
+    assert STATE_LIB in scripts and BOOTSTRAP in scripts
+    offenders = [
+        f"{path.relative_to(REPO_ROOT)}: {cmd}"
+        for path in scripts
+        for cmd in _logical_commands("\n".join(_code_lines(path)))
+        if not _MESSAGE_CMDS.match(cmd) and any(token in cmd for token in _FORBIDDEN_IN_SCRIPTS)
+    ]
+    assert offenders == []
+
+
+def test_bastion_ships_backend_config_without_extra_heredoc() -> None:
+    commands = _logical_commands("\n".join(_code_lines(BASTION)))
+    ship = [c for c in commands if "backend.hcl" in c and c.startswith("ssh ")]
+    assert len(ship) == 1
+    assert "umask 077" in ship[0]
+    assert '< "${BACKEND_HCL}"' in ship[0]
+
+
+def test_bastion_pins_terraform_with_checksum() -> None:
+    text = BASTION.read_text()
+    assert 'TERRAFORM_VERSION="1.17.1"' in text
+    assert re.search(r'TERRAFORM_SHA256="[0-9a-f]{64}"', text)
+    assert "sha256sum -c -" in text
+    assert "apt-get install -y terraform" not in text
+    for stack in ("vector-infraestructura", "rag/infrastructure", "ingesta/infrastructure"):
+        tf = (REPO_ROOT / stack / "terraform.tf").read_text()
+        assert 'required_version = "~> 1.17.1"' in tf
+        assert re.search(r'backend\s+"s3"\s*\{[^}]*use_lockfile\s*=\s*true', tf, flags=re.S)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="requiere git")
+def test_gitignore_keeps_states_out_but_tracks_backend_code() -> None:
+    def ignored(path: str) -> bool:
+        return (
+            subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "check-ignore", "-q", "--no-index", path],
+                capture_output=True,
+            ).returncode
+            == 0
+        )
+
+    for path in (
+        "terraform.tfstate",
+        "vector-infraestructura/terraform.tfstate.backup",
+        "rag/infrastructure/errored.tfstate",
+        "backups/rag_stack_s1.tfstate.age",
+        "backend.hcl",
+        "rag/infrastructure/backend.hcl",
+    ):
+        assert ignored(path), path
+    for path in (
+        "scripts/bootstrap_tfstate_bucket.sh",
+        "rag/tests/unit/test_bootstrap_tfstate_bucket.py",
+        "scripts/lib/terraform_state.sh",
+        "backend.hcl.example",
+        "vector-infraestructura/.terraform.lock.hcl",
+    ):
+        assert not ignored(path), path

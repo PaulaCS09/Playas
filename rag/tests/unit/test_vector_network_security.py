@@ -176,6 +176,10 @@ def _run_vector_deploy(
     script = repo / VECTOR_DEPLOY.relative_to(REPO_ROOT)
     script.parent.mkdir(parents=True)
     shutil.copy2(VECTOR_DEPLOY, script)
+    # deploy.sh carga la biblioteca compartida de scripts/lib/.
+    lib = repo / "scripts" / "lib" / "terraform_state.sh"
+    lib.parent.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "scripts" / "lib" / "terraform_state.sh", lib)
     if vector_tfvars is not None:
         (script.parent.parent / "terraform.tfvars").write_text(vector_tfvars)
     infra = repo / "rag" / "infrastructure"

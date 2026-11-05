@@ -30,7 +30,7 @@ consultar [encendido y apagado](#apagarencender-el-cómputo-ahorro-de-costos).
 
 | Herramienta | Versión mínima |
 |---|---|
-| Terraform | 1.7 |
+| Terraform | 1.17.1 (`~> 1.17.1`) |
 | AWS CLI | 2.x |
 | Session Manager Plugin (AWS) | cualquiera |
 | Docker | 24.x |
@@ -82,9 +82,10 @@ El script crea las EC2 con IP estática, actualiza las variables de entorno del 
 Los scripts de despliegue requieren una terminal interactiva: `terraform apply`
 muestra el plan y espera confirmación humana (`--auto-approve` no está
 permitido, y el script se detiene si `TF_CLI_ARGS*` o `TF_INPUT` están
-definidas). Antes de cada apply copian el state local a `~/tfstate-backups/`
-(configurable con `TFSTATE_BACKUP_DIR`), fuera del clon, y dejan el state con
-permisos `600`.
+definidas). Antes de cada apply respaldan el state en `~/tfstate-backups/`
+(configurable con `TFSTATE_BACKUP_DIR`), fuera del clon y con permisos `600`:
+el archivo local o, con backend S3, `terraform state pull` (ver
+[Terraform State remoto](#terraform-state-remoto)).
 
 Al finalizar, `rag/.env` y `rag/infrastructure/terraform.tfvars` quedan actualizados con `CHROMA_HOST` y `OLLAMA_BASE_URL`.
 
@@ -156,6 +157,9 @@ Requisitos:
 - Key pair `vockey` ya creado en EC2 (estándar en AWS Academy) y su `.pem` descargado localmente
 - `rag/.env` con `OPENAI_API_KEY` configurada (se transfiere a la EC2 por stdin, nunca queda
   expuesta en logs ni en el script)
+- `backend.hcl` en la raíz del repositorio (bucket del state de tu cuenta; ver
+  [Terraform State remoto](#terraform-state-remoto)). El script lo comprueba antes de crear
+  nada y lo copia al bastion.
 - `BASTION_SSH_CIDR` con la IP pública autorizada para SSH, con máscara `/32`. El script
   rechaza `0.0.0.0/0`. Si reutiliza el security group del bastion, se detiene cuando alguna
   regla que alcance el puerto 22/tcp (IPv4 o IPv6, protocolo `-1` o un rango de puertos)
@@ -209,7 +213,7 @@ vez de crear una nueva.
 
 ```bash
 cd vector-infraestructura
-terraform init
+terraform init -backend-config=../backend.hcl   # ver "Terraform State remoto"
 terraform apply
 
 # Ver las IPs asignadas
@@ -251,7 +255,7 @@ Inicializa Terraform, aplica la infraestructura, construye las imágenes y fuerz
 
 ```bash
 cd rag/infrastructure
-terraform init
+terraform init -backend-config=../../backend.hcl
 terraform apply
 
 ./scripts/push_images.sh
@@ -264,6 +268,81 @@ aws ecs update-service --cluster rag-playas-prod --service rag-playas-prod-front
 ```
 
 ---
+
+## Terraform State remoto
+
+Los tres stacks (`ingesta/infrastructure`, `vector-infraestructura`,
+`rag/infrastructure`) declaran `backend "s3"` con `use_lockfile = true` y una
+key fija por stack (`<stack>/terraform.tfstate`). Cada integrante usa **un
+bucket en su propia cuenta de Learner Lab**, `rag-playas-tfstate-<account_id>`
+(us-east-1), cuyo nombre va en `backend.hcl` en la raíz del repositorio (no
+versionado; ver `backend.hcl.example`). Terraform: `~> 1.17.1` en los stacks,
+1.17.1 en la CI y en el bastion.
+
+### 1. Crear el bucket (una vez por cuenta)
+
+```bash
+RAG_EXPECTED_AWS_ACCOUNT_ID=<12 dígitos> ./scripts/bootstrap_tfstate_bucket.sh
+cp backend.hcl.example backend.hcl   # poner el bucket que muestra el script
+RAG_EXPECTED_AWS_ACCOUNT_ID=<12 dígitos> ./scripts/bootstrap_tfstate_bucket.sh --verify-only
+```
+
+El script comprueba que las credenciales son de esa cuenta, pide confirmación
+y deja el bucket con BucketOwnerEnforced, Block Public Access completo,
+versionado, SSE-S3 y una política que deniega peticiones sin TLS. No borra
+nada ni configura expiración de versiones. `--verify-only` solo lee.
+
+### 2. Migrar el state local existente (manual, una sola persona por stack)
+
+Los scripts **nunca** migran: si el stack usa backend S3 y queda un
+`terraform.tfstate` local, `deploy.sh` se detiene. La migración la hace una
+persona, desde la copia autoritativa del state (normalmente el bastion), un
+stack cada vez y en este orden: `ingesta/infrastructure`,
+`vector-infraestructura`, `rag/infrastructure`. Cada paso requiere aprobación.
+
+1. Congelar los applies de ese stack y respaldar el state local fuera del clon
+   (y una copia cifrada fuera de AWS). Anotar `lineage`, `serial` y
+   `terraform state list`.
+2. Desde una terminal interactiva (en el bastion, por `ssh -t`):
+   `terraform -chdir=<stack> init -migrate-state -backend-config=<raíz>/backend.hcl`
+   y responder `yes` a la copia. Nunca `-force-copy`.
+3. Comprobar: mismo `lineage`, `serial` igual (o +1), mismo `state list`,
+   `terraform plan` sin cambios y el objeto `<stack>/terraform.tfstate` en S3.
+4. Mover (no borrar) el `terraform.tfstate*` local que quede a
+   `~/tfstate-backups/<stack>/pre-s3-<fecha>/` con permisos 600.
+
+Los demás clones de ese stack, sin state local, se inicializan una vez con
+`terraform -chdir=<stack> init -reconfigure -backend-config=<raíz>/backend.hcl`
+(no copia nada). Si un `deploy.sh` informa de que `init` falló porque el clon
+estaba inicializado con otro backend, es este paso.
+
+### 3. Comportamiento de los scripts con backend S3
+
+- `deploy.sh` exige `backend.hcl` y ejecuta `init -backend-config=<raíz>/backend.hcl`.
+- Antes de cada apply, `terraform state pull` se guarda en
+  `~/tfstate-backups/<stack>/<fecha>/remote.tfstate` (600). Si el pull falla
+  (backend o credenciales) el despliegue se detiene; si el state está vacío
+  también, salvo `ALLOW_EMPTY_STATE=1` para un stack nuevo.
+- `check_sg_drift` (rag) lee `terraform state list` una vez: si falla, se
+  detiene sin sugerir `import`.
+- Los respaldos siguen dentro de la cuenta del lab y en texto plano (600):
+  copiarlos cifrados fuera de AWS sigue siendo responsabilidad del integrante.
+- Solo se ejecutan a mano, nunca desde scripts: `-migrate-state`,
+  `-reconfigure`, `-force-copy`, `terraform state push` y
+  `terraform force-unlock`. Un test estático lo comprueba.
+- La CI valida con `init -backend=false`: no usa el bucket ni credenciales.
+
+### 4. Rollback de un stack migrado
+
+- Sin applies después de migrar: quitar el bloque `backend` en un cambio
+  revisado y `terraform init -migrate-state` hacia local; comprobar `lineage`
+  y `serial` contra S3.
+- Con applies después de migrar: igual, siempre con `-migrate-state` desde S3
+  (restaurar la copia previa dejaría recursos fuera del state).
+- Después, retirar el objeto de S3 (y cualquier `.tflock`) para no tener dos
+  fuentes de verdad.
+- Un lock huérfano (credenciales caducadas a mitad de un apply) se libera con
+  `terraform force-unlock <ID>` solo tras confirmar que no hay otro proceso.
 
 ## Arquitectura desplegada
 
