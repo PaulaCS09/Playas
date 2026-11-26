@@ -14,6 +14,13 @@
 # Nunca ejecutan -migrate-state, -reconfigure, -force-copy, state push ni
 # force-unlock: esas operaciones son manuales (ver README.md, "Terraform State
 # remoto").
+#
+# Traps: backup_state (backend S3) sustituye EXIT, INT y TERM solo mientras
+# dura el `state pull`, para no dejar un state en claro a medias. Guarda antes
+# los traps del llamador (`trap -p`) y los restaura al terminar, también antes
+# de detenerse por error. En esa ventana el trap EXIT previo se encadena tras
+# la limpieza; un INT o TERM restaura los traps previos y sale con 130 (se
+# ejecuta el EXIT previo, no el INT/TERM previo).
 
 # Se fija en backup_state cuando el state está vacío (stack nuevo o sin
 # despliegue previo) y lo usa tf_state_addresses. TF_REMOTE_STATE_EMPTY indica
@@ -191,6 +198,18 @@ tf_require_outside_repo() {
   esac
 }
 
+# Traps EXIT/INT/TERM del llamador (salida de `trap -p`), guardados por
+# backup_state y restaurados por _tf_backup_restore_traps.
+_TF_BACKUP_PREV_TRAPS=""
+
+# _tf_backup_restore_traps: deja EXIT, INT y TERM como estaban antes de
+# backup_state (sin trap si no había ninguno).
+_tf_backup_restore_traps() {
+  trap - EXIT INT TERM
+  # La salida de `trap -p` es entrada válida para el shell (manual de bash).
+  eval "${_TF_BACKUP_PREV_TRAPS}"
+}
+
 # backup_state <directorio_terraform> <nombre_stack>
 # Copia el state fuera del clon con permisos 600 antes del apply.
 #   - Backend local: copia terraform.tfstate* y deja el original en 600.
@@ -200,27 +219,39 @@ tf_require_outside_repo() {
 #     sino un state vacío ({"serial": 0, "lineage": "", ...}): ambos casos
 #     cuentan como "no existe".
 backup_state() {
-  local tf_dir="$1" stack="$2" dest
+  local tf_dir="$1" stack="$2" dest partial quoted_partial prev_exit
   local base="${TFSTATE_BACKUP_DIR:-${HOME}/tfstate-backups}"
   tf_require_outside_repo "${base}"
   dest="${base}/${stack}/$(date +%Y%m%d-%H%M%S)-$$"
 
   if tf_backend_is_s3 "${tf_dir}"; then
     (umask 077; mkdir -p "${dest}")
+    partial="${dest}/remote.tfstate.partial"
+    printf -v quoted_partial '%q' "${partial}"
     # Una interrupción entre el pull y el mv no deja el state en claro a medias.
+    # Los traps previos se guardan para restaurarlos (no se borran con trap -).
+    _TF_BACKUP_PREV_TRAPS="$(trap -p EXIT INT TERM)"
+    # Comando del trap EXIT previo (vacío si no hay), para encadenarlo.
+    prev_exit="$(trap -p EXIT)"
+    if [[ -n "${prev_exit}" ]]; then
+      prev_exit="${prev_exit#trap -- }"
+      eval "prev_exit=${prev_exit% EXIT}"
+    fi
     # shellcheck disable=SC2064  # se expande ahora a propósito
-    trap "rm -f '${dest}/remote.tfstate.partial'" EXIT
+    trap "rm -f ${quoted_partial}; ${prev_exit}" EXIT
     # shellcheck disable=SC2064
-    trap "rm -f '${dest}/remote.tfstate.partial'; exit 130" INT TERM
-    if ! (umask 077; terraform -chdir="${tf_dir}" state pull > "${dest}/remote.tfstate.partial"); then
-      rm -f "${dest}/remote.tfstate.partial"
+    trap "rm -f ${quoted_partial}; _tf_backup_restore_traps; exit 130" INT TERM
+    if ! (umask 077; terraform -chdir="${tf_dir}" state pull > "${partial}"); then
+      rm -f "${partial}"
+      _tf_backup_restore_traps
       tf_fail "terraform state pull falló en ${stack}: error del backend o de credenciales. No se continúa."
     fi
-    if [[ ! -s "${dest}/remote.tfstate.partial" ]] \
-      || grep -Eq '"lineage"[[:space:]]*:[[:space:]]*""' "${dest}/remote.tfstate.partial"; then
-      rm -f "${dest}/remote.tfstate.partial"
+    if [[ ! -s "${partial}" ]] \
+      || grep -Eq '"lineage"[[:space:]]*:[[:space:]]*""' "${partial}"; then
+      rm -f "${partial}"
+      # Solo limpia el directorio recién creado; si no está vacío, se conserva.
       rmdir "${dest}" 2>/dev/null || true
-      trap - EXIT INT TERM
+      _tf_backup_restore_traps
       if [[ "${ALLOW_EMPTY_STATE:-0}" == "1" ]]; then
         TF_STATE_EMPTY=1
         # shellcheck disable=SC2034  # la leen vector-infraestructura y rag/infrastructure (deploy.sh)
@@ -231,8 +262,8 @@ backup_state() {
       tf_fail "El state remoto de ${stack} está vacío. Si es un stack nuevo, repetir con
   ALLOW_EMPTY_STATE=1; si no, revisar bucket y key antes de cualquier apply."
     fi
-    mv "${dest}/remote.tfstate.partial" "${dest}/remote.tfstate"
-    trap - EXIT INT TERM
+    mv "${partial}" "${dest}/remote.tfstate"
+    _tf_backup_restore_traps
     chmod 600 "${dest}/remote.tfstate"
     echo "✓ State remoto respaldado en ${dest}/remote.tfstate"
     return 0

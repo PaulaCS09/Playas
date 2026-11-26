@@ -21,8 +21,10 @@ import os
 import pty
 import re
 import shutil
+import signal
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -45,7 +47,13 @@ case "$*" in
   *" init"*) [[ -n "${FAKE_INIT_FAIL:-}" ]] && exit 1; exit 0 ;;
   *" state pull"*)
     [[ -n "${FAKE_STATE_PULL_FAIL:-}" ]] && { echo "Error: AccessDenied" >&2; exit 1; }
-    printf '%s' "${FAKE_STATE_PULL:-}" ;;
+    printf '%s' "${FAKE_STATE_PULL:-}"
+    # FAKE_PULL_STARTED: avisa de que el pull está en curso (ya escribió parte
+    # del state) y espera a FAKE_PULL_RELEASE (como mucho ~20 s).
+    if [[ -n "${FAKE_PULL_STARTED:-}" ]]; then
+      : > "${FAKE_PULL_STARTED}"
+      for _ in $(seq 200); do [[ -e "${FAKE_PULL_RELEASE}" ]] && break; sleep 0.1; done
+    fi ;;
   *" state list"*)
     [[ -n "${FAKE_STATE_LIST_FAIL:-}" ]] && { echo "Error: ExpiredToken" >&2; exit 1; }
     printf '%b' "${FAKE_STATE_LIST:-}" ;;
@@ -731,8 +739,13 @@ _FORBIDDEN_IN_SCRIPTS = (
     "-reconfigure",
     "state push",
     "force-unlock",
+    "terraform destroy",
+    "state rm",
 )
 _MESSAGE_CMDS = re.compile(r"^\s*(echo|printf|log|ok|warn|fail|tf_fail|step)\b")
+# Invocaciones de Terraform que solo hace una persona a mano, con opciones
+# intermedias (terraform -chdir=X import, terraform state mv, ...).
+_FORBIDDEN_TF_RE = re.compile(r"\bterraform\b.*\s(import|-?destroy|state\s+(rm|mv|push))\b")
 
 
 def _all_shell_scripts() -> list[Path]:
@@ -743,16 +756,91 @@ def _all_shell_scripts() -> list[Path]:
     )
 
 
-def test_scripts_never_run_manual_only_state_operations() -> None:
-    scripts = _all_shell_scripts()
-    assert STATE_LIB in scripts and BOOTSTRAP in scripts
-    offenders = [
+def _executed_segments(cmd: str) -> list[str]:
+    """Partes de una lista de comandos (``&&``, ``||``, ``;``, ``|``, ``$(`` y
+    backticks) que no son mensajes: ``[[ … ]] && echo "terraform … state rm …"``
+    solo muestra texto, pero ``echo y | terraform … import`` o
+    ``echo "$(terraform … destroy)"`` lo ejecutan."""
+    return [seg for seg in re.split(r"&&|\|\|?|;|\$\(|`", cmd) if not _MESSAGE_CMDS.match(seg)]
+
+
+def _manual_only_commands(text: str) -> list[str]:
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    return [
+        seg.strip()
+        for cmd in _logical_commands(code)
+        for seg in _executed_segments(cmd)
+        if any(token in seg for token in _FORBIDDEN_IN_SCRIPTS) or _FORBIDDEN_TF_RE.search(seg)
+    ]
+
+
+def _manual_only_offenders(scripts: list[Path]) -> list[str]:
+    return [
         f"{path.relative_to(REPO_ROOT)}: {cmd}"
         for path in scripts
-        for cmd in _logical_commands("\n".join(_code_lines(path)))
-        if not _MESSAGE_CMDS.match(cmd) and any(token in cmd for token in _FORBIDDEN_IN_SCRIPTS)
+        for cmd in _manual_only_commands(path.read_text())
     ]
-    assert offenders == []
+
+
+def test_scripts_never_run_manual_only_state_operations() -> None:
+    """Ningún script ejecuta import, state rm/mv/push, destroy, force-unlock ni
+    migraciones del backend: son pasos manuales (CONTROLS O1, ADR-004)."""
+    scripts = _all_shell_scripts()
+    for required in (
+        STATE_LIB,
+        BOOTSTRAP,
+        BASTION,
+        VECTOR_DEPLOY,
+        RAG_DEPLOY,
+        REPO_ROOT / "scripts" / "playas.sh",
+        REPO_ROOT / "ingesta" / "infrastructure" / "scripts" / "deploy.sh",
+        REPO_ROOT / "rag" / "infrastructure" / "scripts" / "start.sh",
+        REPO_ROOT / "rag" / "infrastructure" / "scripts" / "stop.sh",
+    ):
+        assert required in scripts, required
+    assert _manual_only_offenders(scripts) == []
+
+
+@pytest.mark.parametrize(
+    ("line", "detected"),
+    [
+        pytest.param("terraform -chdir=x import a b", True, id="import"),
+        pytest.param(
+            'terraform -chdir="${D}" import aws_security_group.alb sg-1', True, id="import-q"
+        ),
+        pytest.param("terraform state mv a b", True, id="state-mv"),
+        pytest.param("terraform -chdir=x state rm a", True, id="state-rm"),
+        pytest.param("terraform state push x.tfstate", True, id="state-push"),
+        pytest.param("terraform -chdir=x destroy", True, id="destroy"),
+        pytest.param("terraform -chdir=x \\\n  destroy", True, id="destroy-continuacion"),
+        pytest.param("[[ -n x ]] && terraform -chdir=x import a b", True, id="tras-and"),
+        pytest.param("terraform -chdir=x init -migrate-state", True, id="migrate-state"),
+        pytest.param("terraform -chdir=x force-unlock 123", True, id="force-unlock"),
+        pytest.param(
+            """printf '%s' "$s" | terraform -chdir=x state push -""", True, id="pipe-state-push"
+        ),
+        pytest.param("echo y | terraform -chdir=x import a b", True, id="pipe-import"),
+        pytest.param('echo "$(terraform -chdir=x destroy)"', True, id="subshell-destroy"),
+        pytest.param("echo `terraform -chdir=x destroy`", True, id="backticks-destroy"),
+        pytest.param("terraform -chdir=x apply -destroy", True, id="apply-destroy"),
+        pytest.param("echo a | xargs terraform -chdir=x state rm", True, id="xargs-state-rm"),
+        # Mensajes que solo indican el comando a una persona (rag deploy.sh).
+        pytest.param(
+            '[[ -n "${s}" ]] && echo "  terraform -chdir=x state rm a"', False, id="echo-and"
+        ),
+        pytest.param('echo "    terraform -chdir=x import a b"', False, id="echo"),
+        pytest.param('tf_fail "no se ejecuta terraform import"', False, id="tf-fail"),
+        pytest.param("# terraform destroy", False, id="comentario"),
+        pytest.param('terraform -chdir="${D}" state list -no-color', False, id="state-list"),
+        pytest.param('terraform -chdir="${D}" state show -no-color "${r}"', False, id="state-show"),
+        pytest.param('ok "$(terraform version | head -1)"', False, id="version-en-mensaje"),
+        pytest.param(
+            "terraform -chdir=x output -raw destroy_flag", False, id="output-destroy-flag"
+        ),
+    ],
+)
+def test_manual_only_check_detects_invocations(line: str, detected: bool) -> None:
+    assert bool(_manual_only_commands(line + "\n")) is detected
 
 
 def test_bastion_ships_backend_config_without_extra_heredoc() -> None:
@@ -793,6 +881,11 @@ def test_gitignore_keeps_states_out_but_tracks_backend_code() -> None:
         "backups/rag_stack_s1.tfstate.age",
         "backend.hcl",
         "rag/infrastructure/backend.hcl",
+        # Planes de Terraform y dumps de bases de datos (pueden contener secretos).
+        "vector-infraestructura/plan.tfplan",
+        "rag/infrastructure/tfplan",
+        "scripts/backup.dump",
+        "rag/infrastructure/terraform.tfvars",
     ):
         assert ignored(path), path
     for path in (
@@ -801,6 +894,10 @@ def test_gitignore_keeps_states_out_but_tracks_backend_code() -> None:
         "scripts/lib/terraform_state.sh",
         "backend.hcl.example",
         "vector-infraestructura/.terraform.lock.hcl",
+        "rag/infrastructure/.terraform.lock.hcl",
+        "ingesta/infrastructure/.terraform.lock.hcl",
+        "rag/infrastructure/terraform.tfvars.example",
+        "vector-infraestructura/terraform.tfvars.example",
     ):
         assert not ignored(path), path
 
@@ -2041,3 +2138,327 @@ def test_state_lib_probe_names_exist_in_terraform() -> None:
         'bucket_name = "${var.project}-data-${data.aws_caller_identity.current.account_id}"'
         in _tf_text("ingesta/infrastructure")
     )
+
+
+# ---------------------------------------------------------------------------
+# Bastion: orígenes SSH que no son CIDR (prefix lists y security groups, S10)
+# ---------------------------------------------------------------------------
+
+# aws que responde a la consulta de orígenes IPv4 del SG reutilizado según lo
+# que pida realmente --query: los pl-… solo aparecen si la consulta incluye
+# PrefixListIds[].PrefixListId y los sg-… solo si incluye UserIdGroupPairs.
+# (El FAKE_AWS genérico devolvería FAKE_SG_V4 para cualquier consulta con
+# "CidrIp", aunque el script dejara de pedir esos orígenes.) El resto de
+# llamadas se delegan en el FAKE_AWS normal.
+SG_SOURCES_AWS = """#!/usr/bin/env bash
+if [[ "$*" == *"describe-security-groups --group-ids"* && "$*" != *CidrIpv6* ]]; then
+  echo "aws $*" >> "${CALL_LOG}"
+  out=()
+  [[ "$*" == *"IpRanges[].CidrIp"* ]] && out+=(${FAKE_SRC_CIDR:-})
+  [[ "$*" == *"PrefixListIds[].PrefixListId"* ]] && out+=(${FAKE_SRC_PL:-})
+  [[ "$*" == *"UserIdGroupPairs[]"* ]] && out+=(${FAKE_SRC_SG:-})
+  (IFS=$'\\t'; echo "${out[*]}")
+  exit 0
+fi
+exec "${BASE_FAKE_AWS}" "$@"
+"""
+
+
+def _sg_sources_env(tmp_path: Path) -> dict[str, str]:
+    wrapper_dir = tmp_path / "bin-sg"
+    wrapper_dir.mkdir(exist_ok=True)
+    wrapper = wrapper_dir / "aws"
+    wrapper.write_text(SG_SOURCES_AWS)
+    wrapper.chmod(0o755)
+    base = tmp_path / "bin"
+    return {
+        "PATH": f"{wrapper_dir}{os.pathsep}{base}{os.pathsep}{os.environ['PATH']}",
+        "BASE_FAKE_AWS": str(base / "aws"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("sources", "unexpected"),
+    [
+        pytest.param({"FAKE_SRC_PL": "pl-0abc"}, "pl-0abc", id="prefix-list"),
+        pytest.param({"FAKE_SRC_SG": "sg-0aa"}, "sg-0aa", id="security-group"),
+        pytest.param(
+            {"FAKE_SRC_CIDR": "203.0.113.10/32", "FAKE_SRC_PL": "pl-0abc"},
+            "pl-0abc",
+            id="cidr-operador-y-prefix-list",
+        ),
+    ],
+)
+def test_bastion_refuses_reused_sg_with_non_cidr_ssh_sources(
+    sources: dict[str, str], unexpected: str, tmp_path: Path
+) -> None:
+    copy, env = _bastion_repo(tmp_path)
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={
+            **env,
+            **_sg_sources_env(tmp_path),
+            **sources,
+            "BASTION_SSH_CIDR": "203.0.113.10/32",
+            "FAKE_AWS_SG_ID": "sg-bastion",
+        },
+    )
+    assert result.returncode != 0
+    assert "orígenes no autorizados" in result.stdout
+    reason = next(line for line in result.stdout.splitlines() if "orígenes no autorizados" in line)
+    assert unexpected in reason
+    assert "203.0.113.10/32" not in reason.split("orígenes no autorizados", 1)[1]
+    assert not any("authorize-security-group-ingress" in c for c in calls)
+    assert not any("revoke-security-group-ingress" in c for c in calls)
+    assert any("PrefixListIds" in c for c in calls if "--group-ids sg-bastion" in c)
+
+
+def test_bastion_reused_sg_query_includes_prefix_lists_and_group_pairs() -> None:
+    commands = _logical_commands("\n".join(_code_lines(BASTION)))
+    queries = [
+        cmd
+        for cmd in commands
+        if "describe-security-groups --group-ids" in cmd and "CidrIpv6" not in cmd
+    ]
+    assert len(queries) == 1, queries
+    for needle in ("IpRanges[].CidrIp", "PrefixListIds[].PrefixListId", "UserIdGroupPairs[]"):
+        assert needle in queries[0], needle
+    # La misma regla de puertos (SSH_RULES) filtra las dos consultas.
+    assert '--query "${SSH_RULES}.' in queries[0]
+
+
+# ---------------------------------------------------------------------------
+# backup_state: traps del llamador (S11)
+# ---------------------------------------------------------------------------
+
+# Script que carga la biblioteca con (o sin) traps EXIT/INT propios, guarda
+# `trap -p` antes y después de backup_state y anota cada ejecución del EXIT.
+BACKUP_CALLER = """
+source "$LIB"
+if [[ -n "${PREV_TRAPS:-}" ]]; then
+  trap 'echo PREV-EXIT >> "$MARK"' EXIT
+  trap 'echo PREV-INT >> "$MARK"' INT
+fi
+trap -p > "$BEFORE"
+backup_state "$TFDIR" stack-x
+trap -p > "$AFTER"
+echo BACKUP-DONE
+"""
+REAL_STATE = '{"version": 4, "serial": 5, "lineage": "abc-123"}'
+
+
+def _backup_caller(tmp_path: Path, prev_traps: bool) -> tuple[list[str], dict[str, str]]:
+    tf_dir = tmp_path / "stack"
+    tf_dir.mkdir(exist_ok=True)
+    (tf_dir / "terraform.tf").write_text(_s3_backend_tf("stack-x"))
+    script = tmp_path / "caller.sh"
+    script.write_text(BACKUP_CALLER)
+    env = {
+        "LIB": str(STATE_LIB),
+        "TFDIR": str(tf_dir),
+        "MARK": str(tmp_path / "exit.log"),
+        "BEFORE": str(tmp_path / "traps-before"),
+        "AFTER": str(tmp_path / "traps-after"),
+    }
+    if prev_traps:
+        env["PREV_TRAPS"] = "1"
+    return ["bash", str(script)], env
+
+
+def _marks(tmp_path: Path) -> list[str]:
+    mark = tmp_path / "exit.log"
+    return mark.read_text().splitlines() if mark.exists() else []
+
+
+def _partials(tmp_path: Path) -> list[Path]:
+    return list((tmp_path / "backups").rglob("*.partial"))
+
+
+@pytest.mark.parametrize("prev_traps", [True, False], ids=["con-traps", "sin-traps"])
+@pytest.mark.parametrize(
+    "env",
+    [
+        pytest.param({"FAKE_STATE_PULL": REAL_STATE}, id="state-real"),
+        pytest.param(
+            {"FAKE_STATE_PULL": EMPTY_REMOTE_STATE, "ALLOW_EMPTY_STATE": "1"},
+            id="vacio-permitido",
+        ),
+    ],
+)
+def test_backup_state_restores_caller_traps(
+    env: dict[str, str], prev_traps: bool, tmp_path: Path
+) -> None:
+    argv, base_env = _backup_caller(tmp_path, prev_traps)
+    result, _ = _exec(argv, tmp_path, tty=False, env_extra={**base_env, **env})
+    assert result.returncode == 0, result.stderr
+    assert "BACKUP-DONE" in result.stdout
+    before = (tmp_path / "traps-before").read_text()
+    after = (tmp_path / "traps-after").read_text()
+    assert after == before
+    if prev_traps:
+        assert "PREV-EXIT" in before and "PREV-INT" in before
+        assert _marks(tmp_path) == ["PREV-EXIT"]
+    else:
+        assert before == ""
+        assert _marks(tmp_path) == []
+    assert not _partials(tmp_path)
+    backups = list((tmp_path / "backups" / "stack-x").glob("*/remote.tfstate"))
+    if "ALLOW_EMPTY_STATE" in env:
+        assert backups == []
+    else:
+        assert len(backups) == 1 and backups[0].read_text() == REAL_STATE
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        pytest.param({"FAKE_STATE_PULL_FAIL": "1"}, "state pull falló", id="pull-falla"),
+        pytest.param(
+            {"FAKE_STATE_PULL": EMPTY_REMOTE_STATE}, "ALLOW_EMPTY_STATE=1", id="vacio-sin-permiso"
+        ),
+    ],
+)
+def test_backup_state_failure_runs_caller_exit_trap_once(
+    env: dict[str, str], message: str, tmp_path: Path
+) -> None:
+    argv, base_env = _backup_caller(tmp_path, True)
+    result, _ = _exec(argv, tmp_path, tty=False, env_extra={**base_env, **env})
+    assert result.returncode == 1
+    assert message in result.stderr
+    assert "BACKUP-DONE" not in result.stdout
+    assert _marks(tmp_path) == ["PREV-EXIT"]
+    assert not _partials(tmp_path)
+    assert not list((tmp_path / "backups").rglob("remote.tfstate"))
+
+
+def _signal_during_pull(tmp_path: Path, send) -> tuple[int, str, str]:
+    """Ejecuta el llamador de backup_state, espera (fichero señal, sin esperas
+    fijas) a que el `state pull` falso haya escrito parte del state y llama a
+    ``send(proc, release)``."""
+    argv, base_env = _backup_caller(tmp_path, True)
+    bin_dir = tmp_path / "bin"
+    _install_fakes(bin_dir)
+    call_log = tmp_path / "calls.log"
+    call_log.write_text("")
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    started = tmp_path / "pull-started"
+    release = tmp_path / "pull-release"
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "HOME": str(home),
+        "CALL_LOG": str(call_log),
+        "TFSTATE_BACKUP_DIR": str(tmp_path / "backups"),
+        "FAKE_STATE_PULL": REAL_STATE,
+        "FAKE_PULL_STARTED": str(started),
+        "FAKE_PULL_RELEASE": str(release),
+        **base_env,
+    }
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while not started.exists():
+            assert proc.poll() is None, proc.communicate()
+            assert time.monotonic() < deadline, "el state pull falso no llegó a empezar"
+            time.sleep(0.02)
+        # El pull ya escribió parte del state en el .partial.
+        partials = _partials(tmp_path)
+        assert len(partials) == 1 and partials[0].read_text() == REAL_STATE
+        send(proc, release)
+        stdout, stderr = proc.communicate(timeout=30)
+    finally:
+        release.touch()
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+    return proc.returncode, stdout, stderr
+
+
+def _term_shell(proc: subprocess.Popen, release: Path) -> None:
+    os.kill(proc.pid, signal.SIGTERM)
+    release.touch()  # el pull termina; bash ejecuta entonces su trap
+
+
+def _term_group(proc: subprocess.Popen, release: Path) -> None:
+    os.killpg(proc.pid, signal.SIGTERM)  # como Ctrl-C: llega también al pull
+
+
+@pytest.mark.parametrize("send", [_term_shell, _term_group], ids=["shell", "grupo"])
+def test_backup_state_term_during_pull_cleans_up_and_exits_130(send, tmp_path: Path) -> None:
+    """TERM mientras `state pull` escribe: sin .partial, salida 130 y el EXIT
+    del llamador una sola vez (el INT del llamador no se ejecuta)."""
+    returncode, stdout, stderr = _signal_during_pull(tmp_path, send)
+    assert returncode == 130, stderr
+    assert "BACKUP-DONE" not in stdout
+    assert not _partials(tmp_path)
+    assert not list((tmp_path / "backups").rglob("remote.tfstate"))
+    assert _marks(tmp_path) == ["PREV-EXIT"]
+
+
+def test_backup_state_untrapped_signal_during_pull_chains_caller_exit(tmp_path: Path) -> None:
+    """Una salida dentro de la ventana del pull que no pasa por INT/TERM (aquí
+    SIGHUP, que bash no atrapa pero sí ejecuta el trap EXIT) usa el trap EXIT
+    de backup_state: borra el .partial y encadena el EXIT del llamador."""
+
+    def hup(proc: subprocess.Popen, release: Path) -> None:
+        os.kill(proc.pid, signal.SIGHUP)
+        release.touch()
+
+    returncode, stdout, stderr = _signal_during_pull(tmp_path, hup)
+    # bash ejecuta el trap EXIT y termina por la propia señal.
+    assert returncode == -signal.SIGHUP, stderr
+    assert "BACKUP-DONE" not in stdout
+    assert not _partials(tmp_path)
+    assert _marks(tmp_path) == ["PREV-EXIT"]
+
+
+# ---------------------------------------------------------------------------
+# rag/infrastructure/scripts/deploy.sh: región (A10)
+# ---------------------------------------------------------------------------
+
+
+def test_rag_deploy_region_follows_aws_cli_precedence_static() -> None:
+    lines = [line.strip() for line in _code_lines(RAG_DEPLOY) if re.match(r"\s*REGION=", line)]
+    assert lines == ['REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"']
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        pytest.param(
+            {"AWS_REGION": "eu-west-1", "AWS_DEFAULT_REGION": "us-west-2"},
+            "eu-west-1",
+            id="aws-region-primero",
+        ),
+        pytest.param({"AWS_DEFAULT_REGION": "us-west-2"}, "us-west-2", id="default-region"),
+        pytest.param({}, "us-east-1", id="sin-variables"),
+        pytest.param({"AWS_REGION": "", "AWS_DEFAULT_REGION": ""}, "us-east-1", id="vacias"),
+    ],
+)
+def test_rag_deploy_region_precedence(env: dict[str, str], expected: str, tmp_path: Path) -> None:
+    copy = _copy_script(RAG_DEPLOY, tmp_path / "repo")
+    (copy.parent.parent / "terraform.tfstate").write_text('{"serial": 3}')
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={
+            **env,
+            "FAKE_AWS_SG_ID": "sg-igual",
+            "FAKE_STATE_SG_ID": "sg-igual",
+            "FAKE_STATE_LIST": ALL_SGS,
+        },
+    )
+    regional = [c for c in calls if c.startswith("aws ec2 ")]
+    assert regional, result.stderr
+    assert regional[0].startswith("aws ec2 describe-vpcs")
+    for call in regional:
+        assert call.endswith(f"--region {expected}") or f"--region {expected} " in call, call

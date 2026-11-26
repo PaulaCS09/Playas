@@ -163,19 +163,23 @@ if [[ -z "${SG_ID}" || "${SG_ID}" == "None" ]]; then
   ok "Security group creado: ${SG_ID} (SSH solo desde ${BASTION_SSH_CIDR})"
 else
   # Lista de permitidos: toda regla que alcance el puerto 22/tcp (protocolo -1 o
-  # un rango tcp que incluya el 22), IPv4 o IPv6, debe ser exactamente BASTION_SSH_CIDR.
+  # un rango tcp que incluya el 22) debe tener como único origen BASTION_SSH_CIDR.
+  # Cualquier otro origen (CIDR IPv4/IPv6, prefix list pl-… o security group
+  # sg-… de UserIdGroupPairs) se trata como no autorizado. Un par sin GroupId
+  # se muestra como sg-sin-id para que tampoco pase desapercibido.
   SSH_RULES="SecurityGroups[0].IpPermissions[?IpProtocol=='-1' || (IpProtocol=='tcp' && FromPort<=\`22\` && ToPort>=\`22\`)]"
   # Asignación directa: si aws falla, set -e detiene el script.
-  SSH_V4_RAW=$(aws ec2 describe-security-groups --group-ids "${SG_ID}" \
-    --query "${SSH_RULES}.IpRanges[].CidrIp" --output text --region "${REGION}")
+  SSH_SRC_RAW=$(aws ec2 describe-security-groups --group-ids "${SG_ID}" \
+    --query "${SSH_RULES}.[IpRanges[].CidrIp, PrefixListIds[].PrefixListId, UserIdGroupPairs[].[GroupId || 'sg-sin-id'][]][][]" \
+    --output text --region "${REGION}")
   SSH_V6_RAW=$(aws ec2 describe-security-groups --group-ids "${SG_ID}" \
     --query "${SSH_RULES}.Ipv6Ranges[].CidrIpv6" --output text --region "${REGION}")
   # La salida text puede ocupar varias líneas o columnas: se aplana a una lista.
-  read -r -a SSH_V4 <<< "$(tr '\n\t' '  ' <<< "${SSH_V4_RAW}")"
+  read -r -a SSH_SRC <<< "$(tr '\n\t' '  ' <<< "${SSH_SRC_RAW}")"
   read -r -a SSH_V6 <<< "$(tr '\n\t' '  ' <<< "${SSH_V6_RAW}")"
   UNEXPECTED=()
   HAS_OPERATOR_CIDR=0
-  for cidr in "${SSH_V4[@]}" "${SSH_V6[@]}"; do
+  for cidr in "${SSH_SRC[@]}" "${SSH_V6[@]}"; do
     [[ -z "${cidr}" || "${cidr}" == "None" ]] && continue
     if [[ "${cidr}" == "${BASTION_SSH_CIDR}" ]]; then
       HAS_OPERATOR_CIDR=1
@@ -186,7 +190,11 @@ else
   if [[ ${#UNEXPECTED[@]} -gt 0 ]]; then
     fail "El security group ${SG_ID} permite SSH desde orígenes no autorizados: ${UNEXPECTED[*]}.
   Una persona debe revisar y revocar esas reglas antes de continuar, por ejemplo:
-    aws ec2 revoke-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 22 --cidr <cidr> --region ${REGION}"
+    aws ec2 revoke-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 22 --cidr <cidr> --region ${REGION}
+    aws ec2 revoke-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 22 --source-group <sg-…> --region ${REGION}
+    aws ec2 revoke-security-group-ingress --group-id ${SG_ID} --region ${REGION} \\
+      --ip-permissions 'IpProtocol=tcp,FromPort=22,ToPort=22,PrefixListIds=[{PrefixListId=<pl-…>}]'
+  (si la regla es de todos los protocolos o de un rango de puertos, revocarla con su protocolo y rango exactos)."
   fi
   if [[ "${HAS_OPERATOR_CIDR}" -eq 0 ]]; then
     announce_ssh_rule "${SG_ID}"

@@ -23,7 +23,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 INFRA_DIR="${SCRIPT_DIR}/.."
 # shellcheck source=../../../scripts/lib/terraform_state.sh
 source "${REPO_ROOT}/scripts/lib/terraform_state.sh"
-REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+# Misma precedencia que la AWS CLI y start.sh/stop.sh: AWS_REGION primero.
+REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 # Coincide con local.name_prefix = var.project + "-" + var.environment (defaults)
 NAME_PREFIX="rag-playas-prod"
 
