@@ -39,8 +39,8 @@ datos) estaba protegido frente a un `destroy` o un reemplazo accidental.
 
 ## Verificación
 
-- `vector-infraestructura/tests/network.tftest.hcl` (5 runs: fase 1, fase 3 sin
+- `vector-infraestructura/tests/network.tftest.hcl` (fase 1, fase 3 sin
   acceso público, rechazo de CIDR abierto, de IPv6 y de SSH distinto de /32).
 - `vector-infraestructura/tests/no_replace.tftest.hcl`: la fase 3 no reemplaza
   las instancias.
-- `rag/tests/unit/test_vector_network_security.py` (12 pruebas).
+- `rag/tests/unit/test_vector_network_security.py`.

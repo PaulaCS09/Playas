@@ -46,7 +46,7 @@ outputs estén marcados como `sensitive`.
 
 ## Verificación
 
-- `rag/tests/unit/test_bootstrap_tfstate_bucket.py` (11 pruebas): orden seguro
+- `rag/tests/unit/test_bootstrap_tfstate_bucket.py`: orden seguro
   de creación, política TLS, confirmación explícita, modo `--verify-only` sin
   escrituras.
 - `test_deploy_scripts_safety.py`: `test_s3_backend_*`, `test_empty_remote_state_guard_*`,

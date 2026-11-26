@@ -13,7 +13,7 @@ pipeline de datos, provisionado en `../../ingesta/infrastructure/`.
 
 ## Requisitos previos
 
-- Terraform 1.17.1 (`~> 1.17.1`), AWS CLI 2.x, credenciales AWS con permisos para ECS/ECR/ALB/EFS/IAM/EC2.
+- Terraform 1.17.1 (`~> 1.17.1`), AWS CLI 2.x, credenciales AWS con permisos para ECS/ECR/ALB/EFS/EC2, CloudWatch Logs (log groups), `sts:GetCallerIdentity`, `iam:GetRole`/`iam:PassRole` sobre LabRole (no se crean roles) y AWS Backup solo si `enable_efs_backup = true`.
 - ChromaDB y Ollama ya desplegados (ver `../../vector-infraestructura/`).
 - `terraform.tfvars` (copiar de `terraform.tfvars.example`) con, como mínimo,
   `postgres_password`, `jwt_secret_key`, `chroma_host`, `ollama_base_url`, y

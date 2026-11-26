@@ -94,6 +94,31 @@ cada stack se planifica sin leer el state de otro.
 - Secretos solo en tfvars y `.env` locales (600); nunca en Git ni en la salida
   de los scripts.
 
+## Limitaciones conocidas
+
+- **Secretos en argumentos de `sed` (S7).** `postgres_password`, `jwt_secret_key` y, en el
+  bastion, `OPENAI_API_KEY` se escriben en los tfvars con `sed -i`
+  (función `update_tfvars` de `vector-infraestructura/scripts/deploy.sh` y el `sed -i` de `openai_api_key` en `scripts/deploy_bastion_ec2.sh`).
+  Durante unos instantes son visibles en `/proc/<pid>/cmdline` en máquinas multiusuario.
+  No se imprimen. Pendiente reescribirlo.
+- **Prefijo de nombres fijo (A11).** `rag-playas-prod` está fijo en la CLI y los scripts
+  (`TF_DEFAULT_PROJECT` y `TF_DEFAULT_ENVIRONMENT` en `scripts/lib/terraform_state.sh`). Cambiar `project`/`environment` en tfvars hace que
+  `status`/`health`/`start`/`stop` busquen nombres que no existen: no cambiarlos.
+- **Deriva en vector (H1).** Los recursos de vector (SG, EIP) que existan fuera del state solo
+  se detectan con state vacío (`ALLOW_EMPTY_STATE`). Con state no vacío no hay una comprobación
+  de deriva equivalente a `check_sg_drift` de rag
+  (`check_sg_drift` en `rag/infrastructure/scripts/deploy.sh`). `status` (`status_vector_eips`,
+  `scripts/playas.sh`) imprime `EIP asignadas: N`, avisa si N no es 2 y lista por
+  `AllocationId` y `Name` las EIP sin `AssociationId`, sin imprimir IPs; si la consulta falla
+  imprime `EIP asignadas: ?` y continúa. No detecta otros recursos de vector fuera del state.
+
+- **`legacy_public_service_access` en `doctor` (R6).** `doctor` lo determina solo desde
+  `vector-infraestructura/terraform.tfvars` e ignora `TF_VAR_legacy_public_service_access`,
+  que sí aceptan `scripts/playas.sh` (comprobación de existencia del tfvars) y
+  `vector-infraestructura/scripts/deploy.sh`. Si se define solo por variable de entorno y
+  `vector_clients_security_group_id` está vacío, `doctor` avisa en lugar de fallar.
+  Recomendación: definirlo en el tfvars.
+
 ## Pendiente de validar en una cuenta real
 
 | Elemento | Qué falta |

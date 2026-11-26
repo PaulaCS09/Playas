@@ -19,7 +19,7 @@ en la CI.
 - La CLI **reutiliza** el `deploy.sh` de cada stack en lugar de duplicarlo, y
   añade `ingesta/infrastructure/scripts/deploy.sh` con el mismo patrón.
 - **Reglas de seguridad fijas:** nunca `destroy`, `-auto-approve`,
-  `-migrate-state`, `import`, `state rm/push` ni `force-unlock`. El apply es
+  `-migrate-state`, `import`, `state rm/push` ni `force-unlock`. La verificación es una comprobación estática por texto de los `*.sh` versionados: detecta `terraform … import|destroy|-destroy|state rm|mv|push`, `-migrate-state` y `force-unlock`, con opciones intermedias (`-chdir`), continuaciones de línea, pipes y sustituciones `$(…)`/backticks, ignorando fragmentos que son solo mensajes (echo/log); no detecta invocaciones construidas indirectamente (subcomando en variable o `eval`). `-auto-approve` se comprueba solo en los `deploy.sh` de los tres stacks, el bastion y `scripts/playas.sh`. El apply es
   interactivo (requiere terminal), `plan` no guarda archivos de plan y la CLI
   falla de forma cerrada ante cualquier error.
 - `deploy all` y `plan all` siguen el orden **ingesta → vector → rag** y se
@@ -41,7 +41,7 @@ en la CI.
 
 ## Verificación
 
-- `rag/tests/unit/test_playas_cli.py` (27 pruebas, con `aws`/`terraform` falsos):
+- `rag/tests/unit/test_playas_cli.py` (con `aws`/`terraform` falsos):
   `test_never_uses_destructive_or_unattended_terraform`,
   `test_deploy_all_follows_dependency_order`, `test_deploy_all_stops_at_first_failure`,
   `test_cli_plan_never_saves_plan_files`, `test_cli_is_shellchecked_by_ci`, …

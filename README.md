@@ -219,6 +219,15 @@ La EC2 (`m4.large`, Ubuntu 24.04, 50GB, instance profile `LabInstanceProfile`) q
 tras el despliegue — puedes conectarte por SSH para depurar o repetir pasos manualmente. El script
 imprime cada paso que ejecuta, tanto localmente como dentro de la instancia.
 
+> **Límites del bastion** (detalle en
+> [DEPLOYMENT.md](docs/infrastructure/DEPLOYMENT.md#alternativa-despliegue-desde-un-bastion)):
+> el despliegue oficial es desde WSL con `scripts/playas.sh`; el bastion no despliega
+> ingesta (`s3_bucket_name` debe venir de un despliegue previo), clona
+> `jpospinalo/playas` y exige la rama `main`, y no copia
+> `vector-infraestructura/terraform.tfvars`: créalo en el bastion con `umask 077` a partir de
+> `terraform.tfvars.example`, con `legacy_public_service_access` y la IP pública del bastion
+> `/32` en `operator_cidr_blocks`.
+
 Usa `BOOTSTRAP_ONLY=1` para solo aprovisionar la EC2 e instalar dependencias (git, Docker,
 Terraform, AWS CLI, uv, Session Manager Plugin) sin ejecutar los despliegues de Terraform:
 
