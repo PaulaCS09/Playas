@@ -138,12 +138,13 @@ jobs:
         run: uv sync --frozen --all-packages --group dev
 
       # Los tests de scripts de despliegue, secretos y red (A1, A2, A5) se
-      # omiten si faltan bash u openssl: se exige que estén para que no se
+      # omiten si faltan bash, openssl o git: se exige que estén para que no se
       # salten en silencio. -ra muestra cualquier test omitido.
       - name: Check script test prerequisites
         run: |
           bash --version | head -1
           openssl version
+          git --version
 
       # Valor solo de prueba, no es un secreto: rag.api.auth exige
       # JWT_SECRET_KEY para firmar tokens y algunas pruebas de registro no lo
@@ -201,17 +202,17 @@ jobs:
       TF_IN_AUTOMATION: "true"
       TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
           terraform_version: "1.17.1"
           terraform_wrapper: false
 
       # Reutiliza los providers entre ejecuciones; la clave cambia con los lock files.
       - name: Cache Terraform providers
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ github.workspace }}/.terraform-plugin-cache
           key: tf-plugins-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
@@ -221,7 +222,7 @@ jobs:
         run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
         with:
           version: "0.12.3"
 
