@@ -120,6 +120,11 @@ tf_init "${INFRA_DIR}" "${REPO_ROOT}"
 # ya existe una copia.
 backup_state "${INFRA_DIR}" "rag-infrastructure"
 
+# Con el state remoto vacío (ALLOW_EMPTY_STATE=1) se crearía de nuevo todo el
+# stack: antes se comprueba (solo lecturas) que la key nunca tuvo state y que
+# no existen ya sus recursos con nombre fijo, y se pide confirmación escrita.
+tf_guard_empty_remote_state "${INFRA_DIR}" "rag-infrastructure"
+
 # ── 1b. Verificar security groups contra AWS (sin modificar el state) ─────────
 log "Verificando security groups existentes en AWS..."
 VPC_ID=$(aws ec2 describe-vpcs \

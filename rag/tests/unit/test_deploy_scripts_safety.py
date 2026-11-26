@@ -39,6 +39,9 @@ pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="requiere b
 FAKE_TERRAFORM = """#!/usr/bin/env bash
 echo "terraform $*" >> "${CALL_LOG}"
 case "$*" in
+  *" workspace show"*)
+    [[ -n "${FAKE_WORKSPACE_FAIL:-}" ]] && { echo "Error: workspace" >&2; exit 1; }
+    echo "${FAKE_WORKSPACE-default}" ;;
   *" init"*) [[ -n "${FAKE_INIT_FAIL:-}" ]] && exit 1; exit 0 ;;
   *" state pull"*)
     [[ -n "${FAKE_STATE_PULL_FAIL:-}" ]] && { echo "Error: AccessDenied" >&2; exit 1; }
@@ -55,22 +58,46 @@ case "$*" in
 esac
 """
 
+# head-bucket distingue el bucket del state (FAKE_HEAD_BUCKET_FAIL) del bucket
+# de datos de ingesta (FAKE_DATA_BUCKET: 404 por defecto, 403 o exists).
+# FAKE_AWS_FAIL_ON=<subcadena> hace fallar (exit 255) la llamada que la contenga.
+# El orden del case importa: las consultas de reglas del bastion (CidrIp*) y el
+# sondeo del guard (SecurityGroups[].GroupId) van antes de la consulta genérica
+# de check_sg_drift (SecurityGroups[0].GroupId).
 FAKE_AWS = """#!/usr/bin/env bash
 echo "aws $*" >> "${CALL_LOG}"
+if [[ -n "${FAKE_AWS_FAIL_ON:-}" && "$*" == *"${FAKE_AWS_FAIL_ON}"* ]]; then
+  echo "An error occurred (AccessDenied)" >&2; exit 255
+fi
 case "$*" in
   *"sts get-caller-identity"*)
     [[ -n "${FAKE_STS_FAIL:-}" ]] && { echo "ExpiredToken" >&2; exit 255; }
     echo "${FAKE_ACCOUNT:-000000000000}" ;;
-  *"s3api head-bucket"*)
+  *"s3api head-bucket --bucket rag-playas-tfstate-"*)
     [[ -n "${FAKE_HEAD_BUCKET_FAIL:-}" ]] && { echo "Not Found (404)" >&2; exit 254; }
     exit 0 ;;
-  *"ec2 describe-instances"*)
-    [[ -n "${FAKE_EC2_FAIL:-}" ]] && { echo "UnauthorizedOperation" >&2; exit 254; }
-    echo "${FAKE_VECTOR_INSTANCES:-}" ;;
-  *describe-vpcs*) echo "vpc-123" ;;
+  *"s3api head-bucket"*)
+    case "${FAKE_DATA_BUCKET:-404}" in
+      exists) exit 0 ;;
+      403) echo "An error occurred (403) when calling the HeadBucket operation: Forbidden" >&2
+           exit 254 ;;
+      *) echo "An error occurred (404) when calling the HeadBucket operation: Not Found" >&2
+         exit 254 ;;
+    esac ;;
+  *"s3api list-object-versions"*) printf '%b' "${FAKE_STATE_VERSIONS-0\\t0}" ;;
+  *"ec2 describe-instances"*) printf '%b' "${FAKE_VECTOR_INSTANCES:-}" ;;
+  *describe-vpcs*) echo "${FAKE_DEFAULT_VPC-vpc-0123456789abcdef0}" ;;
   *describe-security-groups*CidrIpv6*) echo "${FAKE_SG_V6:-}" ;;
   *describe-security-groups*CidrIp*) echo "${FAKE_SG_V4:-}" ;;
+  *describe-security-groups*"SecurityGroups[].GroupId"*) printf '%b' "${FAKE_GUARD_SG:-}" ;;
   *describe-security-groups*) echo "${FAKE_AWS_SG_ID:-None}" ;;
+  *"ec2 describe-addresses"*) printf '%b' "${FAKE_EIPS:-}" ;;
+  *"ecr describe-repositories"*) printf '%b' "${FAKE_ECR:-}" ;;
+  *"logs describe-log-groups"*) printf '%b' "${FAKE_LOG_GROUPS:-}" ;;
+  *"elbv2 describe-load-balancers"*) printf '%b' "${FAKE_ALB:-}" ;;
+  *"elbv2 describe-target-groups"*) printf '%b' "${FAKE_TG:-}" ;;
+  *"efs describe-file-systems"*) printf '%b' "${FAKE_EFS:-}" ;;
+  *"ecs describe-clusters"*) printf '%b' "${FAKE_ECS:-}" ;;
   *describe-images*) echo "None" ;;  # detiene el bastion tras el paso del SG
   *create-security-group*) echo "sg-nuevo" ;;
   *authorize-security-group-ingress*) echo "AWS-WRITE authorize" >&2 ;;
@@ -114,18 +141,19 @@ def _copy_script(src: Path, root: Path) -> Path:
     return root / src.relative_to(REPO_ROOT)
 
 
-def _run(
-    script: Path,
+def _exec(
+    argv: list[str],
     tmp_path: Path,
-    *args: str,
+    *,
     tty: bool = True,
     env_extra: dict[str, str] | None = None,
     merge_stderr: bool = False,
+    stdin_text: str = "\x04",
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     bin_dir = tmp_path / "bin"
     _install_fakes(bin_dir)
     call_log = tmp_path / "calls.log"
-    call_log.touch()
+    call_log.write_text("")
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     # Entorno mínimo construido desde cero: no hereda TF_* del proceso de pytest.
@@ -141,22 +169,31 @@ def _run(
     stdin_master: int | None = None
     if tty:
         stdin_master, stdin = pty.openpty()
+        # Lo que "teclea" la persona. Por defecto Ctrl-D (EOF): un `read` sobre
+        # la pseudo-terminal sin datos se bloquearía hasta el timeout.
+        os.write(stdin_master, stdin_text.encode())
     try:
         result = subprocess.run(
-            ["bash", str(script), *args],
+            argv,
             stdin=stdin if tty else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             # Unir stderr permite comprobar el orden entre mensajes y escrituras en AWS.
             stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
             text=True,
             env=env,
-            timeout=60,
+            timeout=30,
         )
     finally:
         if stdin_master is not None:
             os.close(stdin)
             os.close(stdin_master)
     return result, call_log.read_text().splitlines()
+
+
+def _run(
+    script: Path, tmp_path: Path, *args: str, **kwargs
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    return _exec(["bash", str(script), *args], tmp_path, **kwargs)
 
 
 ALL_SGS = "\\n".join(f"aws_security_group.{name}" for name in ("alb", "app", "efs", "frontend"))
@@ -502,15 +539,23 @@ EMPTY_REMOTE_STATE = (
     '  "lineage": "",\n  "outputs": {},\n  "resources": [],\n  "check_results": null\n}\n'
 )
 
-S3_BACKEND_TF = """terraform {
-  backend "s3" {
-    key          = "stack/terraform.tfstate"
-    region       = "us-east-1"
-    encrypt      = true
-    use_lockfile = true
-  }
-}
-"""
+
+def _s3_backend_tf(stack: str) -> str:
+    """terraform.tf con backend "s3" y la key real del stack (la exige la
+    protección de state vacío)."""
+    return (
+        "terraform {\n"
+        '  backend "s3" {\n'
+        f'    key          = "{stack}/terraform.tfstate"\n'
+        '    region       = "us-east-1"\n'
+        "    encrypt      = true\n"
+        "    use_lockfile = true\n"
+        "  }\n"
+        "}\n"
+    )
+
+
+_SCRIPT_STACK = {VECTOR_DEPLOY: "vector-infraestructura", RAG_DEPLOY: "rag-infrastructure"}
 
 
 def _s3_stack(script: Path, tmp_path: Path, backend_hcl: bool = True) -> tuple[Path, Path, Path]:
@@ -518,7 +563,7 @@ def _s3_stack(script: Path, tmp_path: Path, backend_hcl: bool = True) -> tuple[P
     repo = tmp_path / "repo"
     copy = _copy_script(script, repo)
     tf_dir = copy.parent.parent
-    (tf_dir / "terraform.tf").write_text(S3_BACKEND_TF)
+    (tf_dir / "terraform.tf").write_text(_s3_backend_tf(_SCRIPT_STACK[script]))
     backend = repo / "backend.hcl"
     if backend_hcl:
         backend.write_text('bucket = "rag-playas-tfstate-000000000000"\n')
@@ -597,7 +642,10 @@ def test_s3_backend_empty_state_needs_explicit_opt_in(
     assert not list((tmp_path / "backups").rglob("remote.tfstate"))
 
     result, calls = _run(
-        copy, tmp_path, env_extra={"FAKE_STATE_PULL": pulled, "ALLOW_EMPTY_STATE": "1"}
+        copy,
+        tmp_path,
+        env_extra={"FAKE_STATE_PULL": pulled, "ALLOW_EMPTY_STATE": "1"},
+        stdin_text=f"{stack}\n",
     )
     assert "stack nuevo" in result.stdout
     assert any(" apply" in c and "-auto-approve" not in c for c in calls)
@@ -1005,65 +1053,6 @@ def test_backend_example_and_stack_keys_are_consistent() -> None:
         assert keys == [key], stack
 
 
-def test_vector_empty_remote_state_refuses_existing_instances(tmp_path: Path) -> None:
-    """State remoto vacío + EC2 ya existentes = bucket o key equivocados: no
-    se crean duplicados aunque se haya pedido ALLOW_EMPTY_STATE=1."""
-    copy, _, _ = _s3_stack(VECTOR_DEPLOY, tmp_path)
-    result, calls = _run(
-        copy,
-        tmp_path,
-        env_extra={
-            "FAKE_STATE_PULL": EMPTY_REMOTE_STATE,
-            "ALLOW_EMPTY_STATE": "1",
-            "FAKE_VECTOR_INSTANCES": "i-0abc\ti-0def",
-        },
-    )
-    assert result.returncode != 0
-    assert "ya existen EC2" in result.stderr
-    assert not any(" apply" in c for c in calls)
-    # Solo consultas de lectura a AWS.
-    aws_calls = [c for c in calls if c.startswith("aws")]
-    assert any("ec2 describe-instances" in c for c in aws_calls)
-    assert all(
-        any(
-            op in c for op in ("sts get-caller-identity", "s3api head-bucket", "describe-instances")
-        )
-        for c in aws_calls
-    )
-    # Busca las dos EC2 del stack en cualquier estado no terminado.
-    describe = [c for c in aws_calls if "ec2 describe-instances" in c]
-    assert len(describe) == 1
-    assert "Name=tag:Name,Values=rag-playas-chromadb,rag-playas-ollama" in describe[0]
-    assert "Name=instance-state-name,Values=pending,running,stopping,stopped" in describe[0]
-
-
-def test_rag_empty_remote_state_with_existing_sgs_stops(tmp_path: Path) -> None:
-    copy, _, _ = _s3_stack(RAG_DEPLOY, tmp_path)
-    result, calls = _run(
-        copy,
-        tmp_path,
-        env_extra={
-            "FAKE_STATE_PULL": EMPTY_REMOTE_STATE,
-            "ALLOW_EMPTY_STATE": "1",
-            "FAKE_AWS_SG_ID": "sg-existente",
-        },
-    )
-    assert result.returncode != 0
-    assert "Despliegue detenido sin cambios" in result.stderr
-    assert "El state remoto está vacío pero ya existe el SG" in result.stderr
-    assert (
-        "Revisar backend.hcl y la key antes de desplegar: no importar ni crear duplicados."
-        in result.stderr
-    )
-    # Sin sugerencias de state rm/import: se aplicarían a un state equivocado.
-    output = result.stdout + result.stderr
-    assert "state rm" not in output
-    assert "import aws_security_group" not in output
-    assert not any(" state list" in c for c in calls)  # vacío conocido: sin state list
-    assert not any(" state rm" in c or " import" in c for c in calls)
-    assert not any(" apply" in c for c in calls)
-
-
 # ---------------------------------------------------------------------------
 # Backend S3: existencia del bucket y variables que desvían el backend
 # ---------------------------------------------------------------------------
@@ -1181,53 +1170,6 @@ def test_s3_backend_backs_up_real_state_without_resources(
 
 
 # ---------------------------------------------------------------------------
-# Vector: comprobación de EC2 existentes con state remoto vacío
-# ---------------------------------------------------------------------------
-
-
-def test_vector_empty_remote_state_stops_when_ec2_check_fails(tmp_path: Path) -> None:
-    copy, _, _ = _s3_stack(VECTOR_DEPLOY, tmp_path)
-    result, calls = _run(
-        copy,
-        tmp_path,
-        env_extra={
-            "FAKE_STATE_PULL": EMPTY_REMOTE_STATE,
-            "ALLOW_EMPTY_STATE": "1",
-            "FAKE_EC2_FAIL": "1",
-        },
-    )
-    assert result.returncode != 0
-    assert "No se pudo comprobar si ya existen las EC2" in result.stderr
-    assert not any(" apply" in c for c in calls)
-
-
-@pytest.mark.parametrize(
-    "instances",
-    [
-        pytest.param("", id="vacio"),
-        pytest.param("None", id="none"),
-        pytest.param(" \t ", id="espacios"),
-    ],
-)
-def test_vector_empty_remote_state_without_instances_continues(
-    instances: str, tmp_path: Path
-) -> None:
-    copy, _, _ = _s3_stack(VECTOR_DEPLOY, tmp_path)
-    result, calls = _run(
-        copy,
-        tmp_path,
-        env_extra={
-            "FAKE_STATE_PULL": EMPTY_REMOTE_STATE,
-            "ALLOW_EMPTY_STATE": "1",
-            "FAKE_VECTOR_INSTANCES": instances,
-        },
-    )
-    assert "ya existen EC2" not in result.stderr
-    assert any("ec2 describe-instances" in c for c in calls)
-    assert any(" apply" in c and "-auto-approve" not in c for c in calls)
-
-
-# ---------------------------------------------------------------------------
 # Bastion: el backend S3 se valida antes de crear nada en AWS
 # ---------------------------------------------------------------------------
 
@@ -1243,9 +1185,12 @@ _BASTION_FORBIDDEN_OPS = (
 def _bastion_s3_backend(tmp_path: Path, backend: str | None) -> Path:
     """Declara backend "s3" en los dos stacks del repo temporal del bastion."""
     repo = tmp_path / "repo"
-    for stack in ("vector-infraestructura", "rag/infrastructure"):
+    for stack, key in (
+        ("vector-infraestructura", "vector-infraestructura"),
+        ("rag/infrastructure", "rag-infrastructure"),
+    ):
         (repo / stack).mkdir(parents=True, exist_ok=True)
-        (repo / stack / "terraform.tf").write_text(S3_BACKEND_TF)
+        (repo / stack / "terraform.tf").write_text(_s3_backend_tf(key))
     backend_hcl = repo / "backend.hcl"
     if backend is not None:
         backend_hcl.write_text(backend)
@@ -1328,3 +1273,771 @@ def test_bastion_valid_s3_backend_ships_backend_hcl(tmp_path: Path) -> None:
     ]
     assert len(ships) == 1
     assert len(deploys) == 2
+
+
+# ---------------------------------------------------------------------------
+# Protección ante un state remoto vacío (tf_guard_empty_remote_state)
+# ---------------------------------------------------------------------------
+
+STATE_BUCKET = "rag-playas-tfstate-000000000000"
+ACCOUNT = "000000000000"
+EMPTY_ENV = {"FAKE_STATE_PULL": EMPTY_REMOTE_STATE, "ALLOW_EMPTY_STATE": "1"}
+
+# (llamada aws, variable del aws falso, descripción mostrada, id de ejemplo)
+GUARD_PROBES = {
+    "vector-infraestructura": [
+        ("ec2 describe-instances", "FAKE_VECTOR_INSTANCES", "EC2 de ChromaDB/Ollama", "i-0abc"),
+        (
+            "ec2 describe-security-groups",
+            "FAKE_GUARD_SG",
+            "security groups de vector-infraestructura",
+            "sg-0vec",
+        ),
+        ("ec2 describe-addresses", "FAKE_EIPS", "Elastic IP de ChromaDB/Ollama", "eipalloc-0a"),
+    ],
+    "rag-infrastructure": [
+        (
+            "ec2 describe-security-groups",
+            "FAKE_GUARD_SG",
+            "security groups de rag/infrastructure",
+            "sg-0rag",
+        ),
+        ("ecr describe-repositories", "FAKE_ECR", "repositorios ECR", "rag-playas-prod-backend"),
+        (
+            "logs describe-log-groups",
+            "FAKE_LOG_GROUPS",
+            "log groups de CloudWatch",
+            "/ecs/rag-playas-prod-app",
+        ),
+        ("elbv2 describe-load-balancers", "FAKE_ALB", "ALB", "arn:aws:alb/rag-playas-prod-alb"),
+        ("elbv2 describe-target-groups", "FAKE_TG", "target groups", "arn:aws:tg/backend"),
+        ("efs describe-file-systems", "FAKE_EFS", "EFS de PostgreSQL", "fs-0abc"),
+        ("ecs describe-clusters", "FAKE_ECS", "cluster ECS", "arn:aws:ecs:cluster/rag-playas-prod"),
+    ],
+}
+
+# Argumentos que identifican los recursos del stack en cada sondeo.
+GUARD_PROBE_ARGS = {
+    "vector-infraestructura": {
+        "ec2 describe-instances": [
+            "Name=tag:Name,Values=rag-playas-chromadb,rag-playas-ollama",
+            "Name=instance-state-name,Values=pending,running,stopping,stopped",
+        ],
+        "ec2 describe-security-groups": [
+            "Name=vpc-id,Values=vpc-0123456789abcdef0",
+            "Name=group-name,Values=rag-playas-chromadb,rag-playas-ollama,rag-playas-vector-clients",
+        ],
+        "ec2 describe-addresses": [
+            "Name=tag:Name,Values=rag-playas-chromadb-eip,rag-playas-ollama-eip"
+        ],
+    },
+    "rag-infrastructure": {
+        "ec2 describe-security-groups": [
+            "Name=vpc-id,Values=vpc-0123456789abcdef0",
+            "Name=group-name,Values=rag-playas-prod-alb,rag-playas-prod-app,"
+            "rag-playas-prod-efs,rag-playas-prod-frontend",
+        ],
+        "ecr describe-repositories": [
+            "repositoryName=='rag-playas-prod-backend'",
+            "repositoryName=='rag-playas-prod-frontend'",
+        ],
+        "logs describe-log-groups": [
+            "--log-group-name-prefix /ecs/rag-playas-prod-",
+            "logGroupName=='/ecs/rag-playas-prod-app'",
+            "logGroupName=='/ecs/rag-playas-prod-frontend'",
+        ],
+        "elbv2 describe-load-balancers": ["LoadBalancerName=='rag-playas-prod-alb'"],
+        "elbv2 describe-target-groups": [
+            "TargetGroupName=='rag-playas-prod-backend'",
+            "TargetGroupName=='rag-playas-prod-frontend'",
+        ],
+        "efs describe-file-systems": ["--creation-token rag-playas-prod-postgres"],
+        "ecs describe-clusters": ["--clusters rag-playas-prod ", "status=='ACTIVE'"],
+    },
+}
+
+_STACK_IDS = {"vector-infraestructura": "vector", "rag-infrastructure": "rag"}
+_STACK_SCRIPT = {stack: script for script, stack in _SCRIPT_STACK.items()}
+
+PROBE_CASES = [
+    pytest.param(
+        _STACK_SCRIPT[stack], stack, *probe, id=f"{_STACK_IDS[stack]}-{probe[0].split()[1]}"
+    )
+    for stack, probes in GUARD_PROBES.items()
+    for probe in probes
+]
+
+_READ_ONLY_AWS = ("sts get-caller-identity", "s3api head-bucket", "s3api list-object-versions")
+
+
+def _first(calls: list[str], needle: str) -> int:
+    matches = [i for i, c in enumerate(calls) if needle in c]
+    assert matches, f"falta la llamada {needle!r}: {calls}"
+    return matches[0]
+
+
+def _assert_read_only(calls: list[str]) -> None:
+    for call in calls:
+        if call.startswith("aws "):
+            op = call.split()[2] if len(call.split()) > 2 else ""
+            assert any(r in call for r in _READ_ONLY_AWS) or op.startswith("describe-"), call
+        assert not any(t in call for t in (" import", " state rm", " state push")), call
+
+
+def _assert_no_apply(calls: list[str]) -> None:
+    assert not any(c.startswith("terraform") and " apply" in c for c in calls)
+
+
+@pytest.mark.parametrize(
+    "absent",
+    [
+        pytest.param("", id="vacio"),
+        pytest.param("None", id="none"),
+        pytest.param("None\\tNone\\n \\t", id="none-y-espacios"),
+    ],
+)
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_empty_remote_state_guard_happy_path(
+    script: Path, stack: str, absent: str, tmp_path: Path
+) -> None:
+    """Key sin historial, sin recursos del stack y nombre tecleado: apply
+    interactivo, tras todas las comprobaciones de solo lectura."""
+    copy, _, _ = _s3_stack(script, tmp_path)
+    env = {**EMPTY_ENV, **{var: absent for _, var, _, _ in GUARD_PROBES[stack]}}
+    result, calls = _run(copy, tmp_path, env_extra=env, stdin_text=f"{stack}\n")
+
+    assert f"Escribe {stack} para continuar" in result.stderr
+    assert "creará el stack desde cero" in result.stdout
+    assert "✗" not in result.stderr
+    applies = [c for c in calls if c.startswith("terraform") and " apply" in c]
+    assert len(applies) == 1
+    assert "-input=true" in applies[0].split() and "-auto-approve" not in applies[0]
+
+    steps = [
+        "sts get-caller-identity",
+        "s3api head-bucket",
+        " init -input=false",
+        " workspace show",
+        " state pull",
+        "s3api list-object-versions",
+    ]
+    order = [_first(calls, s) for s in steps]
+    assert order == sorted(order)
+    probes = [_first(calls, op) for op, _, _, _ in GUARD_PROBES[stack]]
+    assert order[-1] < min(probes) and max(probes) < _first(calls, " apply")
+    for op, expected in GUARD_PROBE_ARGS[stack].items():
+        call = calls[_first(calls, op)]
+        assert "--region us-east-1" in call
+        for arg in expected:
+            assert arg in call, (op, arg)
+    _assert_read_only(calls)
+
+
+@pytest.mark.parametrize(
+    ("versions", "message"),
+    [
+        pytest.param("1\\t0", "tiene versiones anteriores", id="versiones"),
+        pytest.param("0\\t1", "tiene versiones anteriores", id="delete-marker"),
+        pytest.param("0\\t0\\n2\\t0", "tiene versiones anteriores", id="segunda-pagina"),
+        pytest.param("", "Respuesta inesperada", id="vacio"),
+        pytest.param("None", "Respuesta inesperada", id="none"),
+        pytest.param("abc", "Respuesta inesperada", id="texto"),
+        pytest.param("0", "Respuesta inesperada", id="un-solo-numero"),
+        pytest.param("0\\tNone", "Respuesta inesperada", id="numero-y-none"),
+    ],
+)
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_empty_remote_state_guard_stops_on_key_history(
+    script: Path, stack: str, versions: str, message: str, tmp_path: Path
+) -> None:
+    copy, _, _ = _s3_stack(script, tmp_path)
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={**EMPTY_ENV, "FAKE_STATE_VERSIONS": versions},
+        stdin_text=f"{stack}\n",
+    )
+    assert result.returncode != 0
+    assert message in result.stderr
+    key = f"{stack}/terraform.tfstate"
+    # La consulta de versiones es la última llamada: ni sondeos, ni prompt, ni apply.
+    assert "s3api list-object-versions" in calls[-1]
+    lov = calls[-1] + " "
+    assert f"--bucket {STATE_BUCKET} " in lov
+    assert f"--expected-bucket-owner {ACCOUNT} " in lov
+    assert f"--prefix {key} " in lov
+    assert f"Versions[?Key=='{key}']" in lov and f"DeleteMarkers[?Key=='{key}']" in lov
+    assert "--region us-east-1 " in lov
+    assert "Escribe" not in result.stderr
+    _assert_no_apply(calls)
+
+
+@pytest.mark.parametrize(("script", "stack", "op", "var", "desc", "rid"), PROBE_CASES)
+def test_empty_remote_state_guard_stops_when_stack_resources_exist(
+    script: Path, stack: str, op: str, var: str, desc: str, rid: str, tmp_path: Path
+) -> None:
+    """Un recurso del stack ya en AWS (state local sin migrar, otra key o state
+    borrado): se lista y no se importa ni se despliega, aunque se teclee el
+    nombre."""
+    copy, _, _ = _s3_stack(script, tmp_path)
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={**EMPTY_ENV, var: f"{rid}\\tNone\\n{rid}-2"},
+        stdin_text=f"{stack}\n",
+    )
+    assert result.returncode != 0
+    assert (
+        f"✗ El state remoto de {stack} está vacío, pero ya existen en AWS recursos del stack:\n"
+        in result.stderr
+    )
+    assert f"\n  - {desc}: {rid} {rid}-2\n" in result.stderr
+    assert result.stderr.count("  - ") == 1
+    assert "No se importa ni se despliega nada" in result.stderr
+    assert "Escribe" not in result.stderr
+    # Se consultan todos los sondeos antes de decidir.
+    for probe_op, _, _, _ in GUARD_PROBES[stack]:
+        _first(calls, probe_op)
+    _assert_no_apply(calls)
+    _assert_read_only(calls)
+    assert "terraform import" not in result.stdout + result.stderr
+
+
+PROBE_FAILURE_CASES = [
+    pytest.param(
+        _STACK_SCRIPT[stack],
+        stack,
+        {"FAKE_AWS_FAIL_ON": op.split()[1]},
+        f"No se pudo comprobar {desc} (credenciales, permisos o red). No se continúa.",
+        id=f"{_STACK_IDS[stack]}-{op.split()[1]}",
+    )
+    for stack, probes in GUARD_PROBES.items()
+    for op, _, desc, _ in probes
+] + [
+    pytest.param(
+        _STACK_SCRIPT[stack],
+        stack,
+        env,
+        message,
+        id=f"{_STACK_IDS[stack]}-{case}",
+    )
+    for stack in GUARD_PROBES
+    for case, env, message in (
+        (
+            "list-object-versions-falla",
+            {"FAKE_AWS_FAIL_ON": "list-object-versions"},
+            "No se pudo consultar el historial de versiones",
+        ),
+        (
+            "vpc-falla",
+            {"FAKE_AWS_FAIL_ON": "describe-vpcs"},
+            "No se pudo consultar la VPC por defecto",
+        ),
+        ("sin-vpc-none", {"FAKE_DEFAULT_VPC": "None"}, "No se encontró la VPC por defecto"),
+        ("sin-vpc-vacia", {"FAKE_DEFAULT_VPC": ""}, "No se encontró la VPC por defecto"),
+    )
+]
+
+
+@pytest.mark.parametrize(("script", "stack", "env", "message"), PROBE_FAILURE_CASES)
+def test_empty_remote_state_guard_stops_when_a_check_fails(
+    script: Path, stack: str, env: dict[str, str], message: str, tmp_path: Path
+) -> None:
+    """Un fallo de AWS nunca se toma como "no existe"."""
+    copy, _, _ = _s3_stack(script, tmp_path)
+    result, calls = _run(copy, tmp_path, env_extra={**EMPTY_ENV, **env}, stdin_text=f"{stack}\n")
+    assert result.returncode != 0
+    assert message in result.stderr
+    # Se detiene en la consulta que falló (o justo tras la VPC sin id).
+    assert calls[-1].startswith("aws ")
+    if "FAKE_AWS_FAIL_ON" in env:
+        assert env["FAKE_AWS_FAIL_ON"] in calls[-1]
+    assert "Escribe" not in result.stderr
+    _assert_no_apply(calls)
+
+
+@pytest.mark.parametrize(
+    "typed",
+    [
+        pytest.param("otro\n", id="otro-nombre"),
+        pytest.param("\n", id="vacia"),
+        pytest.param("\x04", id="eof"),
+        pytest.param("{stack}-x\n", id="sufijo"),
+        pytest.param("{upper}\n", id="mayusculas"),
+        pytest.param("{prefix}\n", id="prefijo"),
+        pytest.param("{stack}\x04\x04", id="sin-enter"),
+    ],
+)
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_empty_remote_state_guard_requires_exact_stack_name(
+    script: Path, stack: str, typed: str, tmp_path: Path
+) -> None:
+    copy, _, _ = _s3_stack(script, tmp_path)
+    text = typed.format(stack=stack, upper=stack.upper(), prefix=stack.split("-")[0])
+    result, calls = _run(copy, tmp_path, env_extra=EMPTY_ENV, stdin_text=text)
+    assert result.returncode != 0
+    assert f"Escribe {stack} para continuar" in result.stderr
+    assert f"✗ Confirmación no recibida para {stack}. No se despliega." in result.stderr
+    _assert_no_apply(calls)
+
+
+SECRET_SENTINEL = "SENTINEL-S3CRET-9f1c"
+_GUARD_VARS = {
+    "vector-infraestructura": ["project"],
+    "rag-infrastructure": ["project", "environment", "aws_region"],
+}
+
+
+def _defaults_cases() -> list:
+    cases = []
+    for stack, variables in _GUARD_VARS.items():
+        script, sid = _STACK_SCRIPT[stack], _STACK_IDS[stack]
+        for var in variables:
+            cases.append(
+                pytest.param(
+                    script,
+                    stack,
+                    {f"TF_VAR_{var}": ""},
+                    {},
+                    f"TF_VAR_{var} está definida",
+                    id=f"{sid}-env-vacia-{var}",
+                )
+            )
+            cases.append(
+                pytest.param(
+                    script,
+                    stack,
+                    {},
+                    {
+                        "terraform.tfvars": f'postgres_password = "{SECRET_SENTINEL}"\n'
+                        f'  {var}="{SECRET_SENTINEL}"\n'
+                    },
+                    f"terraform.tfvars fija {var}.",
+                    id=f"{sid}-tfvars-{var}",
+                )
+            )
+        cases += [
+            pytest.param(
+                script,
+                stack,
+                {"TF_VAR_project": SECRET_SENTINEL},
+                {},
+                "TF_VAR_project está definida",
+                id=f"{sid}-env-project",
+            ),
+            pytest.param(
+                script,
+                stack,
+                {},
+                {"zz.auto.tfvars": f'project = "{SECRET_SENTINEL}"\n'},
+                "zz.auto.tfvars fija project.",
+                id=f"{sid}-auto-tfvars",
+            ),
+            pytest.param(
+                script,
+                stack,
+                {},
+                {"x.tfvars.json": f'{{"api_key": "{SECRET_SENTINEL}"}}'},
+                "Hay archivos *.tfvars.json",
+                id=f"{sid}-tfvars-json",
+            ),
+        ]
+    return cases
+
+
+@pytest.mark.parametrize(("script", "stack", "env", "files", "message"), _defaults_cases())
+def test_empty_remote_state_guard_requires_default_names(
+    script: Path,
+    stack: str,
+    env: dict[str, str],
+    files: dict[str, str],
+    message: str,
+    tmp_path: Path,
+) -> None:
+    """Los sondeos buscan los nombres por defecto: si una variable podría
+    cambiarlos, se detiene antes de buscar nombres equivocados."""
+    copy, tf_dir, _ = _s3_stack(script, tmp_path)
+    for name, content in files.items():
+        (tf_dir / name).write_text(content)
+    result, calls = _run(copy, tmp_path, env_extra={**EMPTY_ENV, **env}, stdin_text=f"{stack}\n")
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert SECRET_SENTINEL not in result.stdout + result.stderr
+    assert "s3api list-object-versions" in calls[-1]  # antes de cualquier sondeo
+    assert not any("describe-" in c for c in calls)
+    _assert_no_apply(calls)
+
+
+def test_empty_remote_state_guard_ignores_unrelated_tfvars_lines(tmp_path: Path) -> None:
+    copy, tf_dir, _ = _s3_stack(RAG_DEPLOY, tmp_path)
+    (tf_dir / "terraform.tfvars").write_text(
+        f'# project = "otro"\nproject_alias = "x"\npostgres_password = "{SECRET_SENTINEL}"\n'
+    )
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={**EMPTY_ENV, "TF_VAR_other": "1"},
+        stdin_text="rag-infrastructure\n",
+    )
+    assert "fija" not in result.stderr
+    assert SECRET_SENTINEL not in result.stdout + result.stderr
+    assert any(c.startswith("terraform") and " apply" in c for c in calls)
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        pytest.param({"FAKE_WORKSPACE": "dev"}, "no es 'default'", id="otro-workspace"),
+        pytest.param({"FAKE_WORKSPACE": ""}, "no es 'default'", id="salida-vacia"),
+        pytest.param({"FAKE_WORKSPACE_FAIL": "1"}, "workspace show falló", id="falla"),
+    ],
+)
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_s3_backend_requires_default_workspace(
+    script: Path, stack: str, env: dict[str, str], message: str, tmp_path: Path
+) -> None:
+    """Un workspace seleccionado cambia la key a env:/<workspace>/<key>."""
+    copy, _, _ = _s3_stack(script, tmp_path)
+    result, calls = _run(copy, tmp_path, env_extra={**EMPTY_ENV, **env}, stdin_text=f"{stack}\n")
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert " workspace show" in calls[-1]
+    assert _first(calls, " init -input=false") < len(calls) - 1
+    assert not any(" state pull" in c or " workspace select" in c for c in calls)
+    _assert_no_apply(calls)
+
+
+@pytest.mark.parametrize(("script", "stack"), STACK_SCRIPTS)
+def test_allow_empty_state_with_existing_state_skips_guard(
+    script: Path, stack: str, tmp_path: Path
+) -> None:
+    """Regresión del despliegue normal: con state real, ALLOW_EMPTY_STATE=1 no
+    activa la protección (ni historial, ni sondeos, ni prompt)."""
+    copy, _, _ = _s3_stack(script, tmp_path)
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={
+            "FAKE_STATE_PULL": REAL_REMOTE_STATE,
+            "ALLOW_EMPTY_STATE": "1",
+            "FAKE_STATE_VERSIONS": "5\\t0",
+            "FAKE_VECTOR_INSTANCES": "i-0abc",
+            "FAKE_GUARD_SG": "sg-0abc",
+        },
+    )
+    assert not any("list-object-versions" in c for c in calls)
+    assert "Escribe" not in result.stderr
+    assert "stack nuevo" not in result.stdout
+    assert any(c.startswith("terraform") and " apply" in c for c in calls)
+    assert list((tmp_path / "backups" / stack).glob("*/remote.tfstate"))
+
+
+@pytest.mark.parametrize(
+    ("guard_sg", "drift_sg", "message"),
+    [
+        pytest.param(
+            "sg-existente",
+            "None",
+            "  - security groups de rag/infrastructure: sg-existente",
+            id="guard",
+        ),
+        # Defensa en profundidad: si el SG aparece después del sondeo, la
+        # comprobación de drift tampoco sugiere import en un state vacío.
+        pytest.param(
+            "",
+            "sg-existente",
+            "El state remoto está vacío pero ya existe el SG",
+            id="drift-tras-confirmar",
+        ),
+    ],
+)
+def test_rag_empty_remote_state_with_existing_sgs_stops(
+    guard_sg: str, drift_sg: str, message: str, tmp_path: Path
+) -> None:
+    copy, _, _ = _s3_stack(RAG_DEPLOY, tmp_path)
+    result, calls = _run(
+        copy,
+        tmp_path,
+        env_extra={**EMPTY_ENV, "FAKE_GUARD_SG": guard_sg, "FAKE_AWS_SG_ID": drift_sg},
+        stdin_text="rag-infrastructure\n",
+    )
+    assert result.returncode != 0
+    assert message in result.stderr
+    output = result.stdout + result.stderr
+    assert "state rm" not in output
+    assert "import aws_security_group" not in output
+    assert not any(" state list" in c for c in calls)  # vacío conocido: sin state list
+    _assert_read_only(calls)
+    _assert_no_apply(calls)
+
+
+# La biblioteca cargada directamente: stack ingesta (sin deploy.sh propio) y
+# precondiciones del guard que los deploy.sh no permiten alcanzar.
+
+_LIB_SNIPPET = (
+    'source "$LIB"; TF_REMOTE_STATE_EMPTY="${GUARD_EMPTY-1}"; '
+    'TF_STATE_BUCKET="${GUARD_BUCKET-rag-playas-tfstate-000000000000}"; '
+    'TF_AWS_ACCOUNT_ID="${GUARD_ACCOUNT-000000000000}"; '
+    'tf_guard_empty_remote_state "$TFDIR" "$STACK"; echo GUARD-OK'
+)
+
+
+def _run_lib(
+    tmp_path: Path,
+    stack: str,
+    *,
+    key: str | None = None,
+    env: dict[str, str] | None = None,
+    files: dict[str, str] | None = None,
+    **kwargs,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    tf_dir = tmp_path / "stack"
+    tf_dir.mkdir(exist_ok=True)
+    (tf_dir / "terraform.tf").write_text(_s3_backend_tf(key or stack))
+    for name, content in (files or {}).items():
+        (tf_dir / name).write_text(content)
+    return _exec(
+        ["bash", "-c", _LIB_SNIPPET],
+        tmp_path,
+        env_extra={"LIB": str(STATE_LIB), "TFDIR": str(tf_dir), "STACK": stack, **(env or {})},
+        **kwargs,
+    )
+
+
+def test_guard_ingesta_continues_to_prompt_when_data_bucket_is_absent(tmp_path: Path) -> None:
+    result, calls = _run_lib(tmp_path, "ingesta", stdin_text="ingesta\n")
+    assert result.returncode == 0, result.stderr
+    assert "GUARD-OK" in result.stdout
+    assert "Escribe ingesta para continuar" in result.stderr
+    head = calls[_first(calls, "s3api head-bucket")] + " "
+    assert "--bucket rag-playas-data-000000000000 " in head
+    assert f"--expected-bucket-owner {ACCOUNT} " in head
+    assert "--prefix ingesta/terraform.tfstate " in calls[_first(calls, "list-object-versions")]
+    _assert_read_only(calls)
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        pytest.param(
+            {"FAKE_DATA_BUCKET": "exists"},
+            "  - bucket S3: rag-playas-data-000000000000",
+            id="bucket-existe",
+        ),
+        pytest.param(
+            {"FAKE_DATA_BUCKET": "403"},
+            "No se pudo comprobar el bucket rag-playas-data-000000000000",
+            id="bucket-403",
+        ),
+        pytest.param(
+            {"FAKE_AWS_FAIL_ON": "head-bucket"},
+            "No se pudo comprobar el bucket rag-playas-data-000000000000",
+            id="head-bucket-falla",
+        ),
+    ],
+)
+def test_guard_ingesta_stops_when_data_bucket_exists_or_is_unknown(
+    env: dict[str, str], message: str, tmp_path: Path
+) -> None:
+    result, calls = _run_lib(tmp_path, "ingesta", env=env, stdin_text="ingesta\n")
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert "GUARD-OK" not in result.stdout
+    assert "Escribe" not in result.stderr
+    _assert_read_only(calls)
+
+
+@pytest.mark.parametrize(
+    ("stack", "kwargs", "message", "aws_called"),
+    [
+        pytest.param(
+            "desconocido",
+            {},
+            "Stack desconocido para la protección de state vacío: desconocido.",
+            True,
+            id="stack-desconocido",
+        ),
+        pytest.param(
+            "ingesta",
+            {"key": "otro"},
+            'exactamente una línea key = "ingesta/terraform.tfstate"',
+            False,
+            id="key-de-otro-stack",
+        ),
+        pytest.param(
+            "ingesta",
+            {"tty": False},
+            "se requiere una terminal interactiva",
+            False,
+            id="sin-terminal",
+        ),
+        pytest.param(
+            "ingesta",
+            {"env": {"GUARD_BUCKET": ""}},
+            "No se verificó el backend S3",
+            False,
+            id="backend-sin-verificar",
+        ),
+        pytest.param(
+            "ingesta",
+            {"files": {"terraform.tfvars": 'project = "x"\n'}},
+            "terraform.tfvars fija project.",
+            True,
+            id="ingesta-project-en-tfvars",
+        ),
+        pytest.param(
+            "ingesta",
+            {
+                "files": {
+                    "terraform.tf": _s3_backend_tf("ingesta")
+                    + 'locals {\n  key = "ingesta/terraform.tfstate"\n}\n'
+                }
+            },
+            "debe declarar exactamente una línea key",
+            False,
+            id="key-duplicada",
+        ),
+    ],
+)
+def test_guard_library_fails_closed(
+    stack: str, kwargs: dict, message: str, aws_called: bool, tmp_path: Path
+) -> None:
+    result, calls = _run_lib(tmp_path, stack, stdin_text=f"{stack}\n", **kwargs)
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert "GUARD-OK" not in result.stdout
+    assert bool(calls) is aws_called
+    assert not any("head-bucket" in c or "describe-" in c for c in calls)
+
+
+def test_guard_library_is_noop_when_state_is_not_empty(tmp_path: Path) -> None:
+    result, calls = _run_lib(tmp_path, "ingesta", env={"GUARD_EMPTY": "0"}, tty=False)
+    assert result.returncode == 0
+    assert "GUARD-OK" in result.stdout
+    assert calls == []
+
+
+# Comprobaciones estáticas de la biblioteca.
+
+_ALLOWED_LIB_AWS = {
+    ("sts", "get-caller-identity"),
+    ("s3api", "head-bucket"),
+    ("s3api", "list-object-versions"),
+}
+
+
+def test_state_lib_only_runs_read_only_aws_and_terraform_commands() -> None:
+    commands = [
+        cmd
+        for cmd in _logical_commands("\n".join(_code_lines(STATE_LIB)))
+        if not _MESSAGE_CMDS.match(cmd)
+    ]
+    aws_ops = {
+        (svc, op)
+        for cmd in commands
+        for svc, op in re.findall(r"(?:^|[\s(=])aws\s+([a-z0-9-]+)\s+([a-z0-9-]+)", cmd)
+    }
+    assert _ALLOWED_LIB_AWS <= aws_ops
+    for svc, op in aws_ops:
+        assert (svc, op) in _ALLOWED_LIB_AWS or op.startswith("describe-"), (svc, op)
+    assert {svc for svc, op in aws_ops if op.startswith("describe-")} == {
+        "ec2",
+        "ecr",
+        "logs",
+        "elbv2",
+        "efs",
+        "ecs",
+    }
+    code = "\n".join(commands)
+    for forbidden in ("terraform console", "-lock=false", "plan -out"):
+        assert forbidden not in STATE_LIB.read_text(), forbidden
+    # Subcomandos de Terraform que ejecuta: init y lecturas del state/workspace.
+    tf_subcommands = set(re.findall(r'terraform -chdir="\$\{tf_dir\}" ([a-z]+(?: [a-z]+)?)', code))
+    assert tf_subcommands == {"init", "state pull", "state list", "workspace show"}
+
+
+def _tf_default(stack_dir: str, var: str) -> str:
+    text = (REPO_ROOT / stack_dir / "variables.tf").read_text()
+    block = re.search(rf'variable\s+"{var}"\s*\{{(.*?)\n\}}', text, flags=re.S)
+    assert block, (stack_dir, var)
+    default = re.search(r'^\s*default\s*=\s*"([^"]*)"', block.group(1), flags=re.M)
+    assert default, (stack_dir, var)
+    return default.group(1)
+
+
+def _lib_constant(name: str) -> str:
+    match = re.search(rf'^{name}="([^"]*)"$', STATE_LIB.read_text(), flags=re.M)
+    assert match, name
+    return match.group(1)
+
+
+def test_state_lib_defaults_match_terraform_variables() -> None:
+    project = _lib_constant("TF_DEFAULT_PROJECT")
+    for stack_dir in ("ingesta/infrastructure", "vector-infraestructura", "rag/infrastructure"):
+        assert _tf_default(stack_dir, "project") == project, stack_dir
+    assert _tf_default("rag/infrastructure", "environment") == _lib_constant(
+        "TF_DEFAULT_ENVIRONMENT"
+    )
+    region = _lib_constant("TF_GUARD_REGION")
+    assert _tf_default("rag/infrastructure", "aws_region") == region
+    assert re.search(
+        r"^\s*region\s*=\s*var\.aws_region\s*$",
+        (REPO_ROOT / "rag/infrastructure/providers.tf").read_text(),
+        flags=re.M,
+    )
+    for stack_dir in ("ingesta/infrastructure", "vector-infraestructura"):
+        providers = (REPO_ROOT / stack_dir / "providers.tf").read_text()
+        assert re.findall(r'^\s*region\s*=\s*"([^"]+)"', providers, flags=re.M) == [region]
+    assert re.search(
+        r'name_prefix\s*=\s*"\$\{var\.project\}-\$\{var\.environment\}"',
+        (REPO_ROOT / "rag/infrastructure/locals.tf").read_text(),
+    )
+
+
+def _lib_case_block(stack: str) -> str:
+    text = STATE_LIB.read_text()
+    match = re.search(rf"^\s*{re.escape(stack)}\)\n(.*?)^\s*;;", text, flags=re.M | re.S)
+    assert match, stack
+    return match.group(1)
+
+
+def _tf_text(stack_dir: str) -> str:
+    return "\n".join(p.read_text() for p in sorted((REPO_ROOT / stack_dir).glob("*.tf")))
+
+
+def test_state_lib_probe_names_exist_in_terraform() -> None:
+    vector = _lib_case_block("vector-infraestructura")
+    vector_suffixes = set(re.findall(r"\$\{p\}(-[a-z][a-z-]*)", vector))
+    assert vector_suffixes == {
+        "-chromadb",
+        "-ollama",
+        "-vector-clients",
+        "-chromadb-eip",
+        "-ollama-eip",
+    }
+    vector_tf = _tf_text("vector-infraestructura")
+    for suffix in vector_suffixes:
+        assert f'"${{var.project}}{suffix}"' in vector_tf, suffix
+
+    rag = _lib_case_block("rag-infrastructure")
+    rag_suffixes = set(re.findall(r"\$\{pre\}(-[a-z][a-z-]*)", rag))
+    assert rag_suffixes == {"-alb", "-app", "-efs", "-frontend", "-backend", "-postgres"}
+    rag_tf = _tf_text("rag/infrastructure")
+    for suffix in rag_suffixes:
+        assert f'"${{local.name_prefix}}{suffix}"' in rag_tf, suffix
+    for log_group in ("app", "frontend"):
+        assert f"'/ecs/${{pre}}-{log_group}'" in rag
+        assert f'"/ecs/${{local.name_prefix}}-{log_group}"' in rag_tf
+    assert '--creation-token "${pre}-postgres"' in rag
+    assert 'creation_token   = "${local.name_prefix}-postgres"' in rag_tf
+    assert '--clusters "${pre}"' in rag
+    assert re.search(
+        r'resource\s+"aws_ecs_cluster"\s+"\w+"\s*\{\s*name\s*=\s*local\.name_prefix', rag_tf
+    )
+
+    ingesta = _lib_case_block("ingesta")
+    assert 'tf_guard_bucket_exists "${p}-data-${TF_AWS_ACCOUNT_ID}"' in ingesta
+    assert (
+        'bucket_name = "${var.project}-data-${data.aws_caller_identity.current.account_id}"'
+        in _tf_text("ingesta/infrastructure")
+    )

@@ -86,9 +86,12 @@ session-manager-plugin   # debe responder "was installed successfully"
 >    ```
 >
 > Sin la variable, un state remoto vacío detiene el despliegue: en una cuenta
-> que ya tiene recursos indica un bucket o una key equivocados. No usarla si
-> existe un state local: ese caso es una migración o, fuera de la copia
-> autoritativa, un state antiguo que hay que apartar (ver
+> que ya tiene recursos indica un bucket o una key equivocados. Con ella, el
+> script se detiene igualmente si la key tuvo versiones o si ya existen
+> recursos del stack, y pide escribir el nombre del stack para confirmar (ver
+> [Comportamiento de los scripts con backend S3](#3-comportamiento-de-los-scripts-con-backend-s3)).
+> No usarla si existe un state local: ese caso es una migración o, fuera de la
+> copia autoritativa, un state antiguo que hay que apartar (ver
 > [Terraform State remoto](#terraform-state-remoto), paso 2).
 
 ### 1. Infraestructura vectorial (ChromaDB + Ollama en EC2)
@@ -355,10 +358,10 @@ estaba inicializado con otro backend, es este paso.
 ### 3. Comportamiento de los scripts con backend S3
 
 - `deploy.sh` exige `backend.hcl` y ejecuta `init -input=false -backend-config=<raíz>/backend.hcl`.
-- Antes del `init` se detiene si están definidas `AWS_ENDPOINT_URL`,
-  `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL_STS`, `AWS_S3_ENDPOINT`,
-  `AWS_STS_ENDPOINT` o `TF_WORKSPACE`: redirigirían el backend o la
-  verificación de la cuenta, o cambiarían la key del state.
+- Antes del `init` se detiene si está definida cualquier variable
+  `AWS_ENDPOINT_URL*` (la global o las de cada servicio), `AWS_S3_ENDPOINT`,
+  `AWS_STS_ENDPOINT` o `TF_WORKSPACE`: redirigirían el backend, la
+  verificación de la cuenta o las consultas, o cambiarían la key del state.
 - Comprueba que `backend.hcl` contiene **solo** la línea `bucket` (además de
   comentarios): una `key` en ese archivo sustituiría la de los tres stacks, que
   acabarían compartiendo el mismo state. Comprueba también con
@@ -375,19 +378,57 @@ estaba inicializado con otro backend, es este paso.
   también, salvo `ALLOW_EMPTY_STATE=1` para un stack nuevo. Terraform no
   devuelve una salida vacía cuando la key no existe, sino un state vacío
   (`"serial": 0`, `"lineage": ""`); los scripts tratan ambos casos igual.
-- Con `ALLOW_EMPTY_STATE=1`, el despliegue se detiene igualmente si detecta
-  recursos del stack ya existentes: las EC2 `rag-playas-chromadb`/`rag-playas-ollama`
-  en vector, o los security groups `rag-playas-prod-*` en rag (`check_sg_drift`).
-  Es una comprobación parcial: solo mira esos recursos y con los nombres por
-  defecto (no detecta, p. ej., EIP o security groups de vector sin sus EC2, ni
-  recursos de rag sin sus security groups). Ingesta se aplica a mano y no
-  tiene esta comprobación. Con un state vacío, revisar siempre en el plan que
-  no se proponga crear recursos que ya existen.
-- `check_sg_drift` (rag) lee `terraform state list` una vez: si falla, se
-  detiene sin sugerir `import`. Tampoco lo sugiere cuando el state remoto está
-  vacío (`ALLOW_EMPTY_STATE=1`) y los security groups existen: indica revisar
-  `backend.hcl` y la key, porque importar en un state vacío ocultaría un
-  bucket o una key equivocados.
+- Tras el `init`, `deploy.sh` exige el workspace `default`.
+- Con el state remoto vacío y `ALLOW_EMPTY_STATE=1`, antes del apply
+  (`tf_guard_empty_remote_state`), en este orden y solo con lecturas:
+  1. Exige una terminal interactiva y que el `terraform.tf` del stack declare
+     la key `<stack>/terraform.tfstate`.
+  2. Lista las versiones de la key exacta del stack en el bucket del state
+     (`list-object-versions`). Si hay versiones o marcas de borrado, el state
+     existió y se perdió o se borró: se detiene y la recuperación es manual (ver
+     [Recuperar una versión anterior del state](#recuperar-una-versión-anterior-del-state)).
+     Por eso, si se destruye un stack y se borra su state a propósito, esas
+     versiones bloquean un nuevo despliegue con state vacío hasta una decisión
+     manual: restaurar la versión o, con aprobación, eliminar esas versiones.
+  3. Exige los valores por defecto de las variables con las que se calculan
+     los nombres de los recursos (en rag, `project`, `environment` y
+     `aws_region`; en vector, `project`): sin `TF_VAR_*`, sin esas líneas
+     en `terraform.tfvars` ni en `*.auto.tfvars` y sin `*.tfvars.json`.
+  4. Busca recursos del stack ya existentes: en vector, EC2, security groups y
+     Elastic IP; en rag, security groups, repositorios ECR, log groups, ALB,
+     target groups, EFS y el clúster ECS. Si encuentra alguno, los lista y se
+     detiene sin desplegar ni sugerir `import` (state local sin migrar, key
+     equivocada o state borrado).
+  5. Pide escribir el nombre del stack (`vector-infraestructura` o
+     `rag-infrastructure`) para confirmar.
+
+  Si falla cualquiera de esas consultas, el despliegue se detiene. Requieren
+  lectura en EC2, ECR, CloudWatch Logs, ELBv2, EFS y ECS, y
+  `s3:ListBucketVersions` sobre el bucket del state; no está verificado que el
+  rol de Learner Lab los conceda. El permiso sobre el bucket se comprueba sin
+  modificar nada (imprime el número de versiones de la key; `0` en un stack
+  nuevo):
+
+  ```bash
+  aws s3api list-object-versions --bucket rag-playas-tfstate-<cuenta> \
+    --prefix vector-infraestructura/terraform.tfstate \
+    --expected-bucket-owner <cuenta> --region us-east-1 \
+    --query "length(Versions[?Key=='vector-infraestructura/terraform.tfstate'] || \`[]\`)" \
+    --output text
+  ```
+
+  Con un state vacío, revisar igualmente en el plan que no se proponga crear
+  recursos que ya existen.
+
+  Ingesta aún se aplica a mano y no tiene estas comprobaciones. Antes de un
+  apply manual de ingesta con el state vacío, comprobar que el bucket de datos
+  no existe: `aws s3api head-bucket --bucket rag-playas-data-<cuenta>
+  --expected-bucket-owner <cuenta> --region us-east-1` debe responder 404. En
+  us-east-1, crear un bucket que ya es de la cuenta podría no dar error y
+  dejarlo bajo un state nuevo (no verificado).
+- `check_sg_drift` (rag) se ejecuta después y lee `terraform state list` una
+  vez: si falla, se detiene sin sugerir `import`. Con el state vacío no lo
+  sugiere nunca (ese caso ya lo detiene la comprobación anterior).
 - Los respaldos siguen dentro de la cuenta del lab y en texto plano (600):
   copiarlos cifrados fuera de AWS sigue siendo responsabilidad del integrante.
 - Solo se ejecutan a mano, nunca desde scripts: `-migrate-state`,
