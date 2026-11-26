@@ -12,7 +12,7 @@ Sistema agéntico de orientación normativa y jurisprudencial sobre playas en Co
 | `rag/infrastructure/` | ECS, ALB, ECR y EFS de la aplicación | [Infraestructura RAG](rag/infrastructure/README.md) |
 | `ingesta/infrastructure/` | Bucket S3 de las capas del pipeline | [Scripts de ingesta](ingesta/docs/SCRIPTS.md#infraestructura-responsabilidades) |
 | `data/` | Corpus versionado, respaldo de ChromaDB y datos semilla | [Datos](data/README.md) |
-| `scripts/` | Herramientas que coordinan varios componentes | Despliegue desde bastion, descrito abajo |
+| `scripts/` | CLI de operación (`playas.sh`), bootstrap del state y bastion | [Infraestructura](docs/infrastructure/README.md) |
 
 `rag/` e `ingesta/` son proyectos Python independientes, con sus propios
 entornos y locks. El frontend utiliza Bun dentro del workspace de `rag/`.
@@ -71,14 +71,31 @@ session-manager-plugin   # debe responder "was installed successfully"
 
 ## Despliegue automático
 
+`scripts/playas.sh` es el punto de entrada de operación: reutiliza los scripts
+de esta sección y añade comprobaciones de solo lectura.
+
+```bash
+scripts/playas.sh doctor              # herramientas, credenciales, cuenta, backend y contratos
+scripts/playas.sh bootstrap           # bucket del Terraform State (una vez por cuenta)
+scripts/playas.sh plan all            # init + plan de ingesta → vector → rag, sin aplicar
+scripts/playas.sh deploy <stack|all>  # deploy.sh de cada stack, apply interactivo
+scripts/playas.sh status | health     # estado, costes fijos y health checks
+scripts/playas.sh backup-state all    # copia cifrada (GPG) del state fuera de AWS
+scripts/playas.sh test                # validaciones locales (las mismas que la CI)
+```
+
+Arquitectura, orden de despliegue, AWS Academy y resolución de problemas:
+[docs/infrastructure/](docs/infrastructure/README.md).
+
 > **Primer despliegue en una cuenta de Learner Lab nueva** (sin state en S3):
 >
 > 1. Crear el bucket del state y `backend.hcl` (ver
 >    [Terraform State remoto](#terraform-state-remoto), paso 1).
-> 2. Ejecutar los dos `deploy.sh` (o el bastion) con `ALLOW_EMPTY_STATE=1`
+> 2. Ejecutar los `deploy.sh` (o el bastion) con `ALLOW_EMPTY_STATE=1`
 >    **solo en esa ejecución**, como prefijo del comando, sin exportarla:
 >
 >    ```bash
+>    ALLOW_EMPTY_STATE=1 ./ingesta/infrastructure/scripts/deploy.sh
 >    ALLOW_EMPTY_STATE=1 ./vector-infraestructura/scripts/deploy.sh
 >    ALLOW_EMPTY_STATE=1 ./rag/infrastructure/scripts/deploy.sh
 >    # o, desde el bastion:
@@ -420,17 +437,18 @@ estaba inicializado con otro backend, es este paso.
   Con un state vacío, revisar igualmente en el plan que no se proponga crear
   recursos que ya existen.
 
-  Ingesta aún se aplica a mano y no tiene estas comprobaciones. Antes de un
-  apply manual de ingesta con el state vacío, comprobar que el bucket de datos
-  no existe: `aws s3api head-bucket --bucket rag-playas-data-<cuenta>
-  --expected-bucket-owner <cuenta> --region us-east-1` debe responder 404. En
-  us-east-1, crear un bucket que ya es de la cuenta podría no dar error y
-  dejarlo bajo un state nuevo (no verificado).
+  Ingesta se despliega con `ingesta/infrastructure/scripts/deploy.sh` (o
+  `scripts/playas.sh deploy ingesta`), con las mismas comprobaciones: con el
+  state vacío se detiene si el bucket `rag-playas-data-<cuenta>` ya existe
+  (en us-east-1, crear un bucket que ya es de la cuenta podría no dar error y
+  dejarlo bajo un state nuevo; no verificado).
 - `check_sg_drift` (rag) se ejecuta después y lee `terraform state list` una
   vez: si falla, se detiene sin sugerir `import`. Con el state vacío no lo
   sugiere nunca (ese caso ya lo detiene la comprobación anterior).
-- Los respaldos siguen dentro de la cuenta del lab y en texto plano (600):
-  copiarlos cifrados fuera de AWS sigue siendo responsabilidad del integrante.
+- Los respaldos automáticos de los `deploy.sh` quedan en texto plano (600)
+  en `TFSTATE_BACKUP_DIR`. Para una copia cifrada fuera de AWS:
+  `scripts/playas.sh backup-state all` desde el equipo del integrante (ver
+  [docs/infrastructure/DEPLOYMENT.md](docs/infrastructure/DEPLOYMENT.md#respaldo-cifrado-del-state)).
 - Solo se ejecutan a mano, nunca desde scripts: `-migrate-state`,
   `-reconfigure`, `-force-copy`, `terraform state push` y
   `terraform force-unlock`. Un test estático lo comprueba.
