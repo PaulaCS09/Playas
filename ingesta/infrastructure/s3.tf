@@ -15,7 +15,7 @@ resource "aws_s3_bucket" "data" {
 
   # Contiene el corpus (raw/bronze/silver/gold): bloquea destroy y reemplazos
   # accidentales. Sin force_destroy, AWS además rechaza borrar un bucket con
-  # objetos. Ver "Protección del bucket" en ingesta/README.md.
+  # objetos. Ver "Protección del bucket" en ingesta/infrastructure/README.md.
   lifecycle {
     prevent_destroy = true
   }

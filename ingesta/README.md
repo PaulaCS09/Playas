@@ -37,23 +37,6 @@ con bucket, credenciales AWS y proveedor LLM. No versionar secretos. Ver
 - `utils/`: backup y mantenimiento de corpus heredados; no son etapas normales.
 - `infrastructure/`: bucket S3. Las EC2 pertenecen a `../vector-infraestructura/`.
 
-### Protección del bucket
-
-`aws_s3_bucket.data` tiene `prevent_destroy = true` y versionado activado:
-`terraform destroy` del stack falla, y sin `force_destroy` AWS tampoco borra un
-bucket con objetos. Para retirarlo de forma consciente: respaldar el contenido
-(`make bucket-backup`), quitar `prevent_destroy` en un cambio revisado, vaciar
-el bucket (incluidas las versiones) y ejecutar `terraform plan -destroy` antes de
-`terraform destroy`.
-
-`prevent_destroy` solo actúa sobre planes de Terraform: no impide borrar objetos
-o el bucket desde la consola o la CLI de AWS, ni `terraform state rm`. El state
-de este stack usa el backend S3 (`terraform -chdir=ingesta/infrastructure init
--backend-config=../../backend.hcl`; ver "Terraform State remoto" en el README
-raíz). Si se pierde, el bucket queda fuera de Terraform y un `apply` posterior
-fallaría al intentar crearlo de nuevo (el nombre ya existe). Resguardar el state
-y no modificar el bucket fuera de Terraform.
-
 ## Contrato actual y límites operacionales
 
 `loaders` lee `data/bronze/<doc_type>/` y escribe
