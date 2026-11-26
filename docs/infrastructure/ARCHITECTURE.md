@@ -3,7 +3,12 @@
 Describe lo declarado en el repositorio. Que los recursos existan en una
 cuenta solo se sabe tras desplegarlos (`scripts/playas.sh status`).
 
-## Decisión de base (ADR-001, 2026-11-01)
+![Arquitectura de infraestructura de PLAYAS](arquitectura.svg)
+
+El porqué de cada decisión está en los [ADR](adr/README.md); qué control
+verifica cada prueba, en [CONTROLS.md](CONTROLS.md).
+
+## Decisión de base ([ADR-001](adr/001-despliegue-por-cuenta.md), 2026-11-01)
 
 - Cada integrante despliega en **su propia** cuenta de Learner Lab, como
   despliegue nuevo: no se recuperan ni importan recursos ni state de
