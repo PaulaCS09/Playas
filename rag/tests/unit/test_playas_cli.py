@@ -70,6 +70,15 @@ case "$*" in
   *"elbv2 describe-load-balancers"*) printf 'arn:aws:lb/x\tdns.example\n' ;;
   *"elbv2 describe-target-groups"*) echo "arn:aws:elasticloadbalancing:x:targetgroup/backend/1" ;;
   *"elbv2 describe-target-health"*) printf '%b\n' "${FAKE_TG_HEALTH-healthy\thealthy}" ;;
+  *"ec2 describe-addresses"*)
+    [[ -n "${FAKE_EIPS_FAIL:-}" ]] && { echo "An error occurred (AccessDenied)" >&2; exit 255; }
+    # Si la consulta pidiera la IP pública, cada fila la incluiría: la prueba
+    # comprueba que nunca llega a la salida.
+    if [[ "$*" == *PublicIp* ]]; then
+      printf '%b' "${FAKE_EIPS-}" | sed 's/$/\t203.0.113.77/'
+    else
+      printf '%b' "${FAKE_EIPS-}"
+    fi ;;
 esac
 exit 0
 """
@@ -553,3 +562,380 @@ def test_health_fails_on_unhealthy_targets(tmp_path: Path, states: str) -> None:
     result, _ = _run(_tree(tmp_path), tmp_path, "health", env_extra={"FAKE_TG_HEALTH": states})
     assert result.returncode != 0
     assert "comprobaciones fallidas" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# start / stop: terminal y confirmación escrita (S2)
+# ---------------------------------------------------------------------------
+
+
+def _compute_tree(tmp_path: Path) -> Path:
+    """Repo temporal con start.sh/stop.sh falsos que solo registran la llamada."""
+    root = _tree(tmp_path)
+    for action in ("start", "stop"):
+        _write_exec(
+            root / "rag" / "infrastructure" / "scripts" / f"{action}.sh",
+            f'#!/usr/bin/env bash\necho "{action}.sh $*" >> "${{CALL_LOG}}"\nexit 0\n',
+        )
+    return root
+
+
+def _compute_calls(calls: list[str]) -> list[str]:
+    return [c for c in calls if c.startswith(("start.sh", "stop.sh"))]
+
+
+@pytest.mark.parametrize("action", ["start", "stop"])
+def test_compute_requires_terminal(tmp_path: Path, action: str) -> None:
+    result, calls = _run(_compute_tree(tmp_path), tmp_path, action)
+    assert result.returncode != 0
+    assert "terminal interactiva" in result.stderr
+    assert _compute_calls(calls) == []
+
+
+@pytest.mark.parametrize("action", ["start", "stop"])
+def test_compute_runs_script_after_exact_confirmation(tmp_path: Path, action: str) -> None:
+    result, calls = _run(
+        _compute_tree(tmp_path),
+        tmp_path,
+        action,
+        "--uno",
+        "dos tres",
+        tty=True,
+        stdin_text=f"{action}\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert _compute_calls(calls) == [f"{action}.sh --uno dos tres"]
+
+
+@pytest.mark.parametrize(
+    ("action", "answer"),
+    [
+        pytest.param("start", "stop\n", id="start-con-stop"),
+        pytest.param("stop", "start\n", id="stop-con-start"),
+        pytest.param("start", "START\n", id="mayusculas"),
+        pytest.param("start", " start\n", id="espacio-inicial"),
+        pytest.param("start", "start \n", id="espacio-final"),
+        pytest.param("start", "\n", id="vacio"),
+        pytest.param("start", "\x04", id="eof"),
+        pytest.param("stop", "\x04", id="eof-stop"),
+    ],
+)
+def test_compute_cancels_without_exact_confirmation(
+    tmp_path: Path, action: str, answer: str
+) -> None:
+    result, calls = _run(_compute_tree(tmp_path), tmp_path, action, tty=True, stdin_text=answer)
+    assert result.returncode != 0
+    assert "Cancelado." in result.stderr
+    assert _compute_calls(calls) == []
+
+
+# ---------------------------------------------------------------------------
+# doctor: contratos de rag/infrastructure/terraform.tfvars (A2, A3, S9)
+# ---------------------------------------------------------------------------
+
+RAG_TFVARS_OK = (
+    'chroma_host     = "172.31.10.20"\n'
+    'ollama_base_url = "http://172.31.10.21:11434"\n'
+    f's3_bucket_name  = "rag-playas-data-{ACCOUNT}"\n'
+)
+SG_OK = 'vector_clients_security_group_id = "sg-0123456789abcdef0"\n'
+SG_EMPTY_MSG = "vacío con legacy_public_service_access = false"
+SG_LEGACY_MSG = "hoy funciona porque"
+SG_UNKNOWN_MSG = "no se puede saber si es obligatorio"
+
+
+def _write_tfvars(root: Path, stack_rel: str, content: str | bytes) -> Path:
+    path = root / stack_rel / "terraform.tfvars"
+    if isinstance(content, bytes):
+        path.write_bytes(content)
+    else:
+        path.write_text(content)
+    path.chmod(0o600)
+    return path
+
+
+def _doctor(
+    tmp_path: Path, *, rag: str | bytes | None, vector: str | bytes | None
+) -> subprocess.CompletedProcess[str]:
+    root = _tree(tmp_path)
+    if rag is not None:
+        _write_tfvars(root, "rag/infrastructure", rag)
+    if vector is not None:
+        _write_tfvars(root, "vector-infraestructura", vector)
+    result, calls = _run(root, tmp_path, "doctor")
+    # doctor es de solo lectura.
+    assert not any(re.search(r"aws s3api (create|put|delete)", c) for c in calls)
+    return result
+
+
+@pytest.mark.parametrize(
+    "sg_line",
+    [
+        pytest.param("", id="sg-ausente"),
+        pytest.param('vector_clients_security_group_id = ""\n', id="sg-vacio"),
+    ],
+)
+@pytest.mark.parametrize(
+    "vector",
+    [
+        pytest.param(b"legacy_public_service_access = false\n", id="espacios"),
+        pytest.param(b"legacy_public_service_access\t=\tfalse\n", id="tabs"),
+        pytest.param(b"legacy_public_service_access = false\r\n", id="crlf"),
+        pytest.param(b"legacy_public_service_access = false # fase 3\n", id="comentario-hash"),
+        pytest.param(b"legacy_public_service_access = false // fase 3\n", id="comentario-slash"),
+        pytest.param(b"legacy_public_service_access=false#x\n", id="sin-espacios"),
+        pytest.param(
+            b"# legacy_public_service_access = true\nlegacy_public_service_access = false\n",
+            id="comentada-antes",
+        ),
+    ],
+)
+def test_doctor_empty_vector_sg_fails_when_legacy_is_false(
+    tmp_path: Path, sg_line: str, vector: bytes
+) -> None:
+    result = _doctor(tmp_path, rag=RAG_TFVARS_OK + sg_line, vector=vector)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert f"vector_clients_security_group_id {SG_EMPTY_MSG}" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "vector",
+    [
+        pytest.param(b"legacy_public_service_access = true\n", id="espacios"),
+        pytest.param(b"legacy_public_service_access\t=\ttrue\r\n", id="tabs-crlf"),
+        pytest.param(b"legacy_public_service_access = true // fase 1\n", id="comentario"),
+        pytest.param(
+            b"# legacy_public_service_access = false\nlegacy_public_service_access = true\n",
+            id="comentada-antes",
+        ),
+    ],
+)
+def test_doctor_empty_vector_sg_only_warns_when_legacy_is_true(
+    tmp_path: Path, vector: bytes
+) -> None:
+    result = _doctor(tmp_path, rag=RAG_TFVARS_OK, vector=vector)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert SG_EMPTY_MSG not in out
+    assert SG_LEGACY_MSG in result.stdout
+
+
+@pytest.mark.parametrize(
+    "vector",
+    [
+        pytest.param(None, id="tfvars-ausente"),
+        pytest.param("ssh_cidr_blocks = []\n", id="sin-variable"),
+        pytest.param("legacy_public_service_access = maybe\n", id="valor-invalido"),
+        pytest.param("# legacy_public_service_access = false\n", id="solo-comentada"),
+    ],
+)
+def test_doctor_empty_vector_sg_warns_when_legacy_is_unknown(
+    tmp_path: Path, vector: str | None
+) -> None:
+    result = _doctor(tmp_path, rag=RAG_TFVARS_OK, vector=vector)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert SG_EMPTY_MSG not in out
+    assert SG_UNKNOWN_MSG in result.stdout
+
+
+@pytest.mark.parametrize("legacy", ["false", "true"])
+def test_doctor_accepts_vector_sg_when_defined(tmp_path: Path, legacy: str) -> None:
+    result = _doctor(
+        tmp_path,
+        rag=RAG_TFVARS_OK + SG_OK,
+        vector=f"legacy_public_service_access = {legacy}\n",
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "vector_clients_security_group_id definido" in result.stdout
+    assert "doctor: sin errores" in result.stdout
+    for msg in (SG_EMPTY_MSG, SG_LEGACY_MSG, SG_UNKNOWN_MSG):
+        assert msg not in out
+
+
+def test_doctor_warns_that_legacy_opens_services_to_internet(tmp_path: Path) -> None:
+    result = _doctor(tmp_path, rag=None, vector="legacy_public_service_access = true\n")
+    warning = [
+        line for line in result.stdout.splitlines() if "legacy_public_service_access = true" in line
+    ]
+    assert warning, result.stdout
+    assert "0.0.0.0/0" in warning[0]
+    assert "005-red-privada-vector" in warning[0]
+
+
+def test_doctor_does_not_warn_about_internet_when_legacy_is_false(tmp_path: Path) -> None:
+    result = _doctor(tmp_path, rag=None, vector="legacy_public_service_access = false\n")
+    assert "0.0.0.0/0" not in result.stdout + result.stderr
+
+
+RAG_EXAMPLE = REPO_ROOT / "rag" / "infrastructure" / "terraform.tfvars.example"
+
+
+@pytest.mark.parametrize("uncomment_bucket", [False, True], ids=["tal-cual", "con-bucket"])
+def test_doctor_rejects_unmodified_rag_example(tmp_path: Path, uncomment_bucket: bool) -> None:
+    example = RAG_EXAMPLE.read_text()
+    if uncomment_bucket:
+        example += 's3_bucket_name = "rag-playas-data-xxxxxxxxx"\n'
+    result = _doctor(tmp_path, rag=example, vector="legacy_public_service_access = true\n")
+    assert result.returncode != 0
+    for key in ("chroma_host", "ollama_base_url"):
+        assert f"{key} conserva el valor de ejemplo" in result.stderr, key
+    assert ("s3_bucket_name conserva el valor de ejemplo" in result.stderr) is uncomment_bucket
+    # Los secretos del ejemplo nunca se imprimen.
+    assert "cambia-esta" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("chroma_host", "<chromadb_public_ip>"),
+        ("chroma_host", "ec2-xxx-xxx-xxx-xxx.compute-1.amazonaws.com"),
+        ("ollama_base_url", "http://<ollama_public_ip>:11434"),
+        ("ollama_base_url", "cambia-esto"),
+        ("vector_clients_security_group_id", "cambia-esto"),
+        ("vector_clients_security_group_id", "<vector_clients_security_group_id>"),
+        ("s3_bucket_name", "rag-playas-data-xxxxxxxxx"),
+        ("s3_bucket_name", "cambia-esto"),
+    ],
+)
+def test_doctor_rejects_placeholder_contract_values(tmp_path: Path, key: str, value: str) -> None:
+    lines = [
+        line for line in (RAG_TFVARS_OK + SG_OK).splitlines() if not line.startswith(f"{key} ")
+    ]
+    result = _doctor(
+        tmp_path,
+        rag="\n".join([*lines, f'{key} = "{value}"']) + "\n",
+        vector="legacy_public_service_access = false\n",
+    )
+    assert result.returncode != 0
+    assert f"{key} conserva el valor de ejemplo" in result.stderr
+
+
+def test_doctor_accepts_real_contract_values(tmp_path: Path) -> None:
+    result = _doctor(
+        tmp_path,
+        rag=RAG_TFVARS_OK + SG_OK,
+        vector="legacy_public_service_access = false\n",
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "conserva el valor de ejemplo" not in out
+    for key in ("chroma_host", "ollama_base_url", "vector_clients_security_group_id"):
+        assert f"{key} definido" in result.stdout, key
+    assert "s3_bucket_name coincide con el bucket de ingesta" in result.stdout
+
+
+def test_doctor_reports_missing_data_bucket_instead_of_aborting(tmp_path: Path) -> None:
+    """Regresión de tfvars_value: una clave ausente (grep sin coincidencias)
+    es un valor vacío, no un error de lectura ni una salida silenciosa."""
+    rag = "".join(
+        line + "\n" for line in RAG_TFVARS_OK.splitlines() if "s3_bucket_name" not in line
+    )
+    result = _doctor(tmp_path, rag=rag + SG_OK, vector="legacy_public_service_access = false\n")
+    out = result.stdout + result.stderr
+    assert "s3_bucket_name vacío" in result.stdout, out
+    assert "no se puede leer" not in out
+    assert result.returncode == 0, out
+    assert "doctor: sin errores" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# status: Elastic IP de vector (A14)
+# ---------------------------------------------------------------------------
+
+EIP_CHROMA = "eipalloc-0aaa1111\trag-playas-chromadb-eip\teipassoc-0c1"
+EIP_OLLAMA = "eipalloc-0bbb2222\trag-playas-ollama-eip\teipassoc-0c2"
+EIP_OLLAMA_FREE = "eipalloc-0bbb2222\trag-playas-ollama-eip\tNone"
+EIP_EXTRA = "eipalloc-0ccc3333\trag-playas-chromadb-eip\teipassoc-0c3"
+_IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+
+
+def _status_eips(
+    tmp_path: Path, env: dict[str, str]
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    result, calls = _run(_tree(tmp_path), tmp_path, "status", env_extra=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    query = [c for c in calls if "ec2 describe-addresses" in c]
+    assert len(query) == 1
+    assert "rag-playas-chromadb-eip,rag-playas-ollama-eip" in query[0]
+    # Sección de las EIP (la de EC2 sí muestra IP, por diseño).
+    start = result.stdout.index("EIP asignadas")
+    end = result.stdout.index("rag (ECS", start)
+    section = result.stdout[start:end]
+    assert "203.0.113.77" not in result.stdout + result.stderr
+    assert not _IPV4.search(section), section
+    return result, section
+
+
+def test_status_two_associated_eips(tmp_path: Path) -> None:
+    _, section = _status_eips(tmp_path, {"FAKE_EIPS": f"{EIP_CHROMA}\n{EIP_OLLAMA}\n"})
+    assert "EIP asignadas: 2" in section
+    assert "Se esperan 2" not in section
+    assert "sin asociar" not in section
+
+
+def test_status_reports_unassociated_eip(tmp_path: Path) -> None:
+    _, section = _status_eips(tmp_path, {"FAKE_EIPS": f"{EIP_CHROMA}\n{EIP_OLLAMA_FREE}\n"})
+    assert "EIP asignadas: 2" in section
+    assert "EIP sin asociar" in section
+    free = section[section.index("EIP sin asociar") :]
+    assert "eipalloc-0bbb2222 (rag-playas-ollama-eip)" in free
+    assert "eipalloc-0aaa1111" not in free
+
+
+@pytest.mark.parametrize(
+    ("rows", "count"),
+    [
+        pytest.param(EIP_CHROMA, 1, id="una"),
+        pytest.param(f"{EIP_CHROMA}\n{EIP_OLLAMA}\n{EIP_EXTRA}", 3, id="tres"),
+        pytest.param("", 0, id="ninguna"),
+    ],
+)
+def test_status_warns_when_eip_count_is_not_two(tmp_path: Path, rows: str, count: int) -> None:
+    _, section = _status_eips(tmp_path, {"FAKE_EIPS": rows})
+    assert f"EIP asignadas: {count}" in section
+    assert (
+        f"Se esperan 2 EIP etiquetadas de vector (chromadb-eip y ollama-eip); hay {count}."
+        in section
+    )
+
+
+def test_status_eip_query_failure_shows_unknown(tmp_path: Path) -> None:
+    _, section = _status_eips(tmp_path, {"FAKE_EIPS_FAIL": "1"})
+    assert "EIP asignadas: ?" in section
+    assert "No se pudieron consultar las EIP" in section
+    assert "Se esperan 2" not in section
+
+
+# ---------------------------------------------------------------------------
+# test unit: lista de pruebas de infraestructura (A1)
+# ---------------------------------------------------------------------------
+
+_EXPECTED_INFRA_TESTS = [
+    f"tests/unit/test_{name}.py"
+    for name in (
+        "deploy_scripts_safety",
+        "playas_cli",
+        "bootstrap_tfstate_bucket",
+        "script_secret_handling",
+        "vector_network_security",
+        "infra_data_protection",
+    )
+]
+
+
+def test_cli_infra_tests_include_every_infra_test_file() -> None:
+    match = re.search(r"^INFRA_TESTS=\((.*?)^\)", CLI.read_text(), flags=re.M | re.S)
+    assert match, "INFRA_TESTS no encontrado en scripts/playas.sh"
+    listed = _code_text(match.group(1)).split()
+    existing = [t for t in _EXPECTED_INFRA_TESTS if (REPO_ROOT / "rag" / t).is_file()]
+    assert existing, "no se encontró ninguna prueba de infraestructura"
+    missing = [t for t in existing if t not in listed]
+    assert missing == [], missing
+    for t in listed:
+        assert (REPO_ROOT / "rag" / t).is_file(), t
+
+
+def _code_text(text: str) -> str:
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())

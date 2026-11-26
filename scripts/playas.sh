@@ -36,6 +36,7 @@ INFRA_TESTS=(
   tests/unit/test_script_secret_handling.py
   tests/unit/test_vector_network_security.py
   tests/unit/test_playas_cli.py
+  tests/unit/test_infra_data_protection.py
 )
 
 bold='\033[1m'; green='\033[0;32m'; yellow='\033[1;33m'; red='\033[0;31m'; reset='\033[0m'
@@ -61,7 +62,8 @@ Con cambios (piden confirmación humana):
   bootstrap [--verify-only]  Crea/verifica el bucket del Terraform State.
   deploy <stack|all>         Ejecuta el deploy.sh del stack (apply interactivo).
   backup-state <stack|all>   Copia cifrada (GPG) del state fuera de AWS.
-  start | stop               Enciende/apaga el cómputo (EC2 vector y ECS).
+  start | stop               Enciende/apaga el cómputo (EC2 vector y ECS); exige
+                             terminal y escribir la acción (start o stop).
 
 Stacks: ingesta, vector, rag ("all" = ingesta → vector → rag).
 Variables: RAG_EXPECTED_AWS_ACCOUNT_ID (cuenta esperada, 12 dígitos),
@@ -130,10 +132,38 @@ d_ok()   { ok "$*"; }
 d_warn() { warn "$*"; DOCTOR_WARN=$((DOCTOR_WARN + 1)); }
 d_fail() { err "$*"; DOCTOR_FAIL=$((DOCTOR_FAIL + 1)); }
 
-# tfvars_value <archivo> <clave>: valor sin comillas (nunca se imprime si es secreto).
+# tfvars_value <archivo> <clave>: valor de la primera asignación `clave = valor`
+# no comentada, sin comillas, espacios, CR ni comentario final (# o //).
+# Vacío si la clave no está. Devuelve 2 si el archivo no se puede leer.
+# Solo lee texto: nunca evalúa ni carga el tfvars. Nunca se imprime si es secreto.
 tfvars_value() {
-  grep -E "^[[:space:]]*$2[[:space:]]*=" "$1" 2>/dev/null \
-    | sed -E 's/^[^=]+=[[:space:]]*"?([^"#]*)"?.*/\1/' | tr -d ' ' | head -1
+  local line rc=0
+  # -m1 en vez de head: sin SIGPIPE que se confunda con un error de lectura.
+  line=$(grep -m1 -E "^[[:space:]]*$2[[:space:]]*=" "$1" 2>/dev/null) || rc=$?
+  # grep: 1 = la clave no está (valor vacío); 2 = archivo ausente o ilegible.
+  [[ "${rc}" -le 1 ]] || return 2
+  line="${line#*=}"
+  line="${line#"${line%%[![:space:]]*}"}"
+  if [[ "${line}" == \"* ]]; then
+    line="${line#\"}"
+    line="${line%%\"*}"
+  else
+    # Sin comillas (bool o número): termina en espacio, CR, # o /.
+    line="${line%%[[:space:]#/]*}"
+  fi
+  printf '%s\n' "${line}"
+}
+
+# tfvars_placeholder <valor>: 0 si es un valor de ejemplo sin sustituir
+# (terraform.tfvars.example: ec2-xxx…, http://ec2-xxx…, cambia-…,
+# rag-playas-data-xxxxxxxxx; README: <chromadb_public_ip>).
+tfvars_placeholder() {
+  local v="${1#http://}"
+  v="${v#https://}"
+  case "${v}" in
+    ec2-xxx*|cambia-*|*xxx*|*"<"*|*">"*) return 0 ;;
+  esac
+  return 1
 }
 
 file_mode() {
@@ -142,7 +172,8 @@ file_mode() {
 
 cmd_doctor() {
   [[ $# -eq 0 ]] || die "doctor no admite argumentos."
-  local tool version account arn bucket key s rag_tfvars f
+  local tool version account arn bucket key s rag_tfvars vector_tfvars f value
+  local legacy="" legacy_why=""
 
   log "Herramientas"
   for tool in terraform aws curl openssl git; do
@@ -236,21 +267,55 @@ cmd_doctor() {
   done
   [[ -f "$(stack_dir vector)/terraform.tfvars" || -n "${TF_VAR_legacy_public_service_access:-}" ]] \
     || d_warn "vector: falta terraform.tfvars con legacy_public_service_access (copiar terraform.tfvars.example)."
+  # legacy queda en true, false o vacío (no determinable, con el motivo en legacy_why).
+  vector_tfvars="$(stack_dir vector)/terraform.tfvars"
+  if [[ ! -f "${vector_tfvars}" ]]; then
+    legacy_why="no existe vector-infraestructura/terraform.tfvars"
+  elif ! value=$(tfvars_value "${vector_tfvars}" legacy_public_service_access); then
+    legacy_why="vector-infraestructura/terraform.tfvars no se puede leer"
+  elif [[ "${value}" == "true" || "${value}" == "false" ]]; then
+    legacy="${value}"
+  elif [[ -z "${value}" ]]; then
+    legacy_why="legacy_public_service_access no está definida en vector-infraestructura/terraform.tfvars"
+  else
+    legacy_why="legacy_public_service_access no es true ni false en vector-infraestructura/terraform.tfvars"
+  fi
+  if [[ "${legacy}" == "true" ]]; then
+    d_warn "vector: legacy_public_service_access = true: ChromaDB (8000) y Ollama (11434) quedan abiertos a 0.0.0.0/0. Solo en las fases 1-2 de la migración; pasar a false (ver docs/infrastructure/adr/005-red-privada-vector.md)."
+  fi
 
   log "Contratos entre stacks (rag/infrastructure/terraform.tfvars)"
   rag_tfvars="$(stack_dir rag)/terraform.tfvars"
   if [[ ! -f "${rag_tfvars}" ]]; then
     d_warn "No existe todavía: lo crea 'deploy vector' desde el ejemplo."
+  elif [[ ! -r "${rag_tfvars}" ]]; then
+    d_fail "rag/infrastructure/terraform.tfvars no se puede leer: no se comprueban los contratos."
   else
     for key in chroma_host ollama_base_url vector_clients_security_group_id; do
-      [[ -n "$(tfvars_value "${rag_tfvars}" "${key}")" ]] \
-        && d_ok "${key} definido (output de vector)" \
-        || d_warn "${key} vacío: ejecuta 'deploy vector' antes de 'deploy rag'."
+      if ! value=$(tfvars_value "${rag_tfvars}" "${key}"); then
+        d_fail "rag/infrastructure/terraform.tfvars no se puede leer (${key})."
+      elif [[ -n "${value}" ]] && tfvars_placeholder "${value}"; then
+        d_fail "${key} conserva el valor de ejemplo: ejecuta 'deploy vector' antes de 'deploy rag'."
+      elif [[ -n "${value}" ]]; then
+        d_ok "${key} definido (output de vector)"
+      elif [[ "${key}" != "vector_clients_security_group_id" ]]; then
+        d_warn "${key} vacío: ejecuta 'deploy vector' antes de 'deploy rag'."
+      elif [[ "${legacy}" == "false" ]]; then
+        # Con false, ChromaDB/Ollama solo admiten el SG vector_clients.
+        d_fail "${key} vacío con legacy_public_service_access = false: el backend ECS no llegará a ChromaDB/Ollama. Ejecuta 'deploy vector' antes de 'deploy rag'."
+      elif [[ "${legacy}" == "true" ]]; then
+        d_warn "${key} vacío: hoy funciona porque legacy_public_service_access = true abre 8000/11434, pero el backend perderá ChromaDB/Ollama al pasar a false. Ejecuta 'deploy vector' antes de 'deploy rag'."
+      else
+        d_warn "${key} vacío y no se puede saber si es obligatorio (${legacy_why}); con legacy_public_service_access = false el backend no llegará a ChromaDB/Ollama. Ejecuta 'deploy vector' antes de 'deploy rag'."
+      fi
     done
     local data_bucket
-    data_bucket=$(tfvars_value "${rag_tfvars}" s3_bucket_name)
-    if [[ -z "${data_bucket}" ]]; then
+    if ! data_bucket=$(tfvars_value "${rag_tfvars}" s3_bucket_name); then
+      d_fail "rag/infrastructure/terraform.tfvars no se puede leer (s3_bucket_name)."
+    elif [[ -z "${data_bucket}" ]]; then
       d_warn "s3_bucket_name vacío (output de ingesta)."
+    elif tfvars_placeholder "${data_bucket}"; then
+      d_fail "s3_bucket_name conserva el valor de ejemplo: usa el output s3_bucket_name de ingesta."
     elif [[ -n "${account}" && "${data_bucket}" != "${TF_DEFAULT_PROJECT}-data-${account}" ]]; then
       d_fail "s3_bucket_name=${data_bucket} no es el bucket de ingesta de esta cuenta (${TF_DEFAULT_PROJECT}-data-${account})."
     else
@@ -371,6 +436,35 @@ cmd_backup_state() {
 # q <comando aws...>: imprime la salida o "?" si la consulta falla.
 q() { "$@" 2>/dev/null || echo "?"; }
 
+# status_vector_eips: recuento de las EIP etiquetadas de vector (se esperan 2)
+# y las que no están asociadas (cobran sin uso). Solo AllocationId y Name;
+# nunca imprime la IP pública. Si la consulta falla, muestra "?" y lo avisa.
+status_vector_eips() {
+  local out alloc name assoc
+  local -a rows=() unassociated=()
+  if ! out=$(aws ec2 describe-addresses --region "${REGION}" \
+      --filters "Name=tag:Name,Values=${TF_DEFAULT_PROJECT}-chromadb-eip,${TF_DEFAULT_PROJECT}-ollama-eip" \
+      --query 'Addresses[].[AllocationId,Tags[?Key==`Name`]|[0].Value,AssociationId]' \
+      --output text 2>/dev/null); then
+    echo "  EIP asignadas: ?"
+    warn "  No se pudieron consultar las EIP de vector (credenciales o permisos)."
+    return 0
+  fi
+  [[ -z "${out}" ]] || mapfile -t rows <<< "${out}"
+  echo "  EIP asignadas: ${#rows[@]}"
+  for out in "${rows[@]}"; do
+    read -r alloc name assoc <<< "${out}"
+    [[ -n "${assoc}" && "${assoc}" != "None" ]] || unassociated+=("${alloc} (${name:-sin Name})")
+  done
+  if [[ "${#rows[@]}" -ne 2 ]]; then
+    warn "  Se esperan 2 EIP etiquetadas de vector (chromadb-eip y ollama-eip); hay ${#rows[@]}."
+  fi
+  if [[ "${#unassociated[@]}" -gt 0 ]]; then
+    warn "  EIP sin asociar (cobran sin uso):"
+    printf '    %s\n' "${unassociated[@]}"
+  fi
+}
+
 cmd_status() {
   [[ $# -eq 0 ]] || die "status no admite argumentos."
   local account bucket s key out
@@ -408,9 +502,7 @@ cmd_status() {
               "Name=instance-state-name,Values=pending,running,stopping,stopped" \
     --query 'Reservations[].Instances[].[Tags[?Key==`Name`]|[0].Value,InstanceType,State.Name,PublicIpAddress]' \
     --output text | sed 's/^/  /'
-  echo "  EIP asignadas: $(q aws ec2 describe-addresses --region "${REGION}" \
-    --filters "Name=tag:Name,Values=${TF_DEFAULT_PROJECT}-chromadb-eip,${TF_DEFAULT_PROJECT}-ollama-eip" \
-    --query 'length(Addresses)' --output text)"
+  status_vector_eips
 
   log "rag (ECS, ALB, EFS)"
   q aws ecs describe-services --region "${REGION}" --cluster "${NAME_PREFIX}" \
@@ -551,8 +643,13 @@ cmd_test() {
 
 # ── start / stop ──────────────────────────────────────────────────────────────
 cmd_compute() {
-  local action="$1"
+  local action="$1" answer=""
   shift
+  require_tty "${action} (pide confirmación)"
+  # EOF o error de lectura: answer queda vacía y se cancela abajo.
+  IFS= read -r -p "Vas a ejecutar '${action}' sobre EC2 vector y ECS. Escribe ${action} para continuar: " answer \
+    || answer=""
+  [[ "${answer}" == "${action}" ]] || die "Cancelado."
   exec "${REPO_ROOT}/rag/infrastructure/scripts/${action}.sh" "$@"
 }
 
