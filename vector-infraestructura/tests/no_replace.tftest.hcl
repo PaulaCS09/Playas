@@ -1,6 +1,13 @@
 # Pasar de la fase 1 a la fase 3 de la migración de red no debe reemplazar
 # las EC2 (perderían el índice de ChromaDB). Prueba sin AWS con provider simulado.
 # Ejecutar desde vector-infraestructura/: terraform init -backend=false && terraform test
+#
+# Limitación: con mock_provider "aws" esta prueba solo detecta reemplazos que
+# derivan de la configuración (p. ej. replace_triggered_by, nombres,
+# count/for_each). No detecta los que decide el provider real (atributos
+# ForceNew), porque el mock no los conoce. La protección real son
+# prevent_destroy, ignore_changes = [ami, user_data] y la revisión humana del
+# plan (ningún "must be replaced").
 
 mock_provider "aws" {}
 

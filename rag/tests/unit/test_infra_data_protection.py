@@ -81,3 +81,51 @@ def test_comment_does_not_count_as_protection() -> None:
     )
     block = _resource_block(text, "aws_s3_bucket", "data")
     assert not re.search(r"prevent_destroy\s*=\s*true", block)
+
+
+# S4: un cambio de AMI o de user_data reemplazaría las EC2 de vector (y con
+# ellas los datos de ChromaDB y los modelos de Ollama); con prevent_destroy el
+# plan fallaría. Terraform debe ignorar esos dos atributos.
+VECTOR_INSTANCES = [
+    pytest.param("vector-infraestructura/chromadb.tf", "chromadb", id="ec2-chromadb"),
+    pytest.param("vector-infraestructura/ollama.tf", "ollama", id="ec2-ollama"),
+]
+
+
+def _ignore_changes(block: str) -> set[str] | None:
+    lifecycle = re.search(r"lifecycle\s*\{[^}]*\}", block)
+    if not lifecycle:
+        return None
+    match = re.search(r"ignore_changes\s*=\s*\[([^\]]*)\]", lifecycle.group(0))
+    if not match:
+        return None
+    return {item.strip() for item in match.group(1).split(",") if item.strip()}
+
+
+@pytest.mark.parametrize(("path", "name"), VECTOR_INSTANCES)
+def test_vector_instances_ignore_ami_and_user_data(path: str, name: str) -> None:
+    text = _strip_comments((REPO_ROOT / path).read_text(encoding="utf-8"))
+    block = _resource_block(text, "aws_instance", name)
+    ignored = _ignore_changes(block)
+    assert ignored is not None, f"{path}: aws_instance.{name} sin lifecycle.ignore_changes"
+    assert {"ami", "user_data"} <= ignored, (
+        f"{path}: aws_instance.{name} debe ignorar ami y user_data (tiene {sorted(ignored)})"
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        pytest.param("ignore_changes = [user_data, ami]", {"ami", "user_data"}, id="orden-inverso"),
+        pytest.param(
+            "ignore_changes = [\n  ami,\n  user_data,\n]", {"ami", "user_data"}, id="multilinea"
+        ),
+        pytest.param("# ignore_changes = [ami, user_data]", None, id="comentado"),
+        pytest.param("ignore_changes = [ami]", {"ami"}, id="solo-ami"),
+    ],
+)
+def test_ignore_changes_parser(body: str, expected: set[str] | None) -> None:
+    text = _strip_comments(
+        f'resource "aws_instance" "x" {{\n  lifecycle {{\n    prevent_destroy = true\n    {body}\n  }}\n}}\n'
+    )
+    assert _ignore_changes(_resource_block(text, "aws_instance", "x")) == expected
