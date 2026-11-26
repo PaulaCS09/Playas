@@ -79,6 +79,10 @@ dist/
 # Configuración local del backend S3 (bucket de la cuenta). No afecta a
 # .terraform.lock.hcl, que sí se versiona.
 backend.hcl
+# Planes de Terraform y dumps de bases de datos (pueden contener secretos).
+*.tfplan
+tfplan
+*.dump
 
 # 12) Claude
 settings.local.json
