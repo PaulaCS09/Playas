@@ -145,7 +145,12 @@ jobs:
           bash --version | head -1
           openssl version
 
+      # Valor solo de prueba, no es un secreto: rag.api.auth exige
+      # JWT_SECRET_KEY para firmar tokens y algunas pruebas de registro no lo
+      # fijan por su cuenta.
       - name: Run unit tests
+        env:
+          JWT_SECRET_KEY: ci-unit-tests-only-not-a-secret-0123456789abcdef
         run: uv run pytest tests/unit/ -ra --cov=rag --cov-report=xml --cov-report=term-missing
 
       - name: Upload coverage
