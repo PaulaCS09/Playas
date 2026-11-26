@@ -195,7 +195,6 @@ jobs:
       AWS_EC2_METADATA_DISABLED: "true"
       TF_IN_AUTOMATION: "true"
       TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
-      TF_STACKS: vector-infraestructura rag/infrastructure ingesta/infrastructure
     steps:
       - uses: actions/checkout@v4
 
@@ -216,42 +215,15 @@ jobs:
       - name: Prepare plugin cache
         run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
 
-      - name: Terraform fmt
-        run: |
-          for stack in $TF_STACKS; do
-            echo "::group::fmt $stack"
-            terraform -chdir="$stack" fmt -check -recursive -diff
-            echo "::endgroup::"
-          done
-
-      - name: Terraform init y validate (sin backend)
-        run: |
-          for stack in $TF_STACKS; do
-            echo "::group::validate $stack"
-            terraform -chdir="$stack" init -backend=false -lockfile=readonly -input=false
-            terraform -chdir="$stack" validate
-            echo "::endgroup::"
-          done
-
-      - name: Terraform test (mock_provider)
-        run: |
-          for stack in $TF_STACKS; do
-            if compgen -G "$stack/tests/*.tftest.hcl" > /dev/null; then
-              echo "::group::test $stack"
-              terraform -chdir="$stack" test
-              echo "::endgroup::"
-            fi
-          done
-
       - name: Install uv
         uses: astral-sh/setup-uv@v3
         with:
           version: "0.12.3"
 
-      # Todos los scripts versionados salvo las utilidades de SageMaker, que no
-      # forman parte del despliegue (sin shebang o con shebang en la línea 2).
-      - name: Shellcheck
-        run: |
-          mapfile -t scripts < <(git ls-files '*.sh' ':!rag/scripts/sagemaker-*.sh')
-          printf '%s\n' "${scripts[@]}"
-          uvx --from shellcheck-py==0.10.0.1 shellcheck -S warning "${scripts[@]}"
+      # Las mismas validaciones que ejecuta en local `scripts/playas.sh test
+      # static`: terraform fmt -check, init -backend=false -lockfile=readonly
+      # (con TF_DATA_DIR temporal), validate y terraform test con mock_provider
+      # en los tres stacks, y shellcheck 0.10 sobre los scripts versionados
+      # (excepto las utilidades de SageMaker). Sin credenciales ni backend.
+      - name: Validaciones estáticas (scripts/playas.sh test static)
+        run: scripts/playas.sh test static
