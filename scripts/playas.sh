@@ -159,7 +159,8 @@ cmd_doctor() {
   done
   if command -v terraform >/dev/null 2>&1; then
     version=$(terraform version 2>/dev/null | head -1 | sed -E 's/^Terraform v//')
-    [[ "${version}" == "${TERRAFORM_VERSION}" ]] && d_ok "Terraform ${version}" \
+    # required_version = "~> 1.17.1": cualquier 1.17.x >= 1.17.1.
+    [[ "${version}" =~ ^1\.17\.([0-9]+)$ && "${BASH_REMATCH[1]}" -ge 1 ]] && d_ok "Terraform ${version}" \
       || d_fail "Terraform ${version:-?}: los stacks exigen ~> ${TERRAFORM_VERSION} (required_version)."
   fi
 
@@ -316,9 +317,6 @@ cmd_backup_state() {
   reject_tf_cli_overrides
   load_stacks "$@"
   dest="${PLAYAS_STATE_BACKUP_DIR:-${HOME}/playas-state-backups}"
-  case "$(cd "$(dirname "${dest}")" 2>/dev/null && pwd)/$(basename "${dest}")/" in
-    "${REPO_ROOT}"/*) die "PLAYAS_STATE_BACKUP_DIR está dentro del clon: los respaldos no se versionan." ;;
-  esac
   if grep -qsi amazon /sys/class/dmi/id/sys_vendor; then
     warn "Parece una EC2: el respaldo quedaría dentro de AWS. Ejecútalo desde tu equipo o copia el .gpg fuera."
   fi
@@ -327,7 +325,12 @@ cmd_backup_state() {
       || die "La clave pública ${PLAYAS_BACKUP_GPG_RECIPIENT} no está en el llavero de gpg."
   else
     require_tty "backup-state sin PLAYAS_BACKUP_GPG_RECIPIENT (gpg pide la frase de paso)"
+    # stdin de gpg es la pipe con el state: pinentry necesita la terminal.
+    GPG_TTY="$(tty)"
+    export GPG_TTY
   fi
+  # Con symlinks resueltos; un destino dentro del clon detiene el respaldo.
+  tf_require_outside_repo "${dest}"
   mkdir -p "${dest}"
   chmod 700 "${dest}"
 
@@ -339,7 +342,8 @@ cmd_backup_state() {
     tf_init "${dir}" "${REPO_ROOT}" >/dev/null
     state=$(terraform -chdir="${dir}" state pull) \
       || die "terraform state pull falló en ${s} (backend o credenciales)."
-    if [[ -z "${state}" ]] || grep -Eq '"lineage"[[:space:]]*:[[:space:]]*""' <<< "${state}"; then
+    # Comprobación en bash puro: un here-string grande se escribiría en /tmp.
+    if [[ -z "${state}" || "${state}" =~ \"lineage\"[[:space:]]*:[[:space:]]*\"\" ]]; then
       warn "${s}: el state remoto está vacío; no hay nada que respaldar."
       continue
     fi
@@ -443,7 +447,8 @@ instance_ip() {
 
 cmd_health() {
   [[ $# -eq 0 ]] || die "health no admite argumentos."
-  local ip dns lb_arn tg tgs
+  local ip dns lb_arn tg tgs states w healthy
+  local -a words
   aws_account >/dev/null || die "No hay credenciales AWS válidas."
 
   log "vector (por IP pública; requiere tu IP en operator_cidr_blocks)"
@@ -470,8 +475,18 @@ cmd_health() {
     tgs=$(aws elbv2 describe-target-groups --region "${REGION}" --load-balancer-arn "${lb_arn}" \
       --query 'TargetGroups[].TargetGroupArn' --output text 2>/dev/null || true)
     for tg in ${tgs}; do
-      echo "  ${tg##*/targetgroup/}: $(q aws elbv2 describe-target-health --region "${REGION}" \
-        --target-group-arn "${tg}" --query 'TargetHealthDescriptions[].TargetHealth.State' --output text)"
+      states=$(q aws elbv2 describe-target-health --region "${REGION}" \
+        --target-group-arn "${tg}" --query 'TargetHealthDescriptions[].TargetHealth.State' --output text)
+      read -r -a words <<< "${states}"
+      healthy=1
+      [[ "${#words[@]}" -gt 0 ]] || healthy=0
+      for w in "${words[@]}"; do [[ "${w}" == "healthy" ]] || healthy=0; done
+      if [[ "${healthy}" -eq 1 ]]; then
+        ok "Targets ${tg##*/targetgroup/}: ${states}"
+      else
+        err "Targets ${tg##*/targetgroup/}: ${states:-sin targets}"
+        HEALTH_FAIL=$((HEALTH_FAIL + 1))
+      fi
     done
   else
     err "ALB ${NAME_PREFIX}-alb no encontrado"; HEALTH_FAIL=$((HEALTH_FAIL + 1))
@@ -506,6 +521,8 @@ test_static() {
   # Scripts versionados (o nuevos sin ignorar), salvo las utilidades de SageMaker.
   mapfile -t scripts < <(cd "${REPO_ROOT}" && git ls-files --cached --others --exclude-standard \
     '*.sh' ':!rag/scripts/sagemaker-*.sh' | sort -u)
+  [[ "${#scripts[@]}" -gt 0 ]] || die "No se encontraron scripts para shellcheck."
+  printf '  %s\n' "${scripts[@]}"
   # Versión fijada (la de la CI); la del sistema solo si no hay uvx.
   if command -v uvx >/dev/null 2>&1; then
     (cd "${REPO_ROOT}" && uvx --from "shellcheck-py==${SHELLCHECK_PY_VERSION}" shellcheck -S warning "${scripts[@]}")

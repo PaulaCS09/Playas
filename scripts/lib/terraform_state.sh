@@ -37,6 +37,8 @@ TF_AWS_ACCOUNT_ID=""
 TF_GUARD_KEY=""
 TF_GUARD_VPC=""
 TF_GUARD_FOUND=""
+# Raíz real del clon (symlinks resueltos), calculada desde esta biblioteca.
+TF_LIB_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
 tf_fail() {
   echo "✗ $*" >&2
@@ -166,6 +168,29 @@ tf_init() {
   fi
 }
 
+# tf_require_outside_repo <directorio>: falla si el directorio, con los
+# symlinks resueltos, queda dentro del clon: los respaldos del state contienen
+# secretos y nunca deben quedar en el repositorio. No crea nada: si aún no
+# existe, resuelve su ancestro existente más cercano.
+tf_require_outside_repo() {
+  local dir="$1" probe rest="" real
+  [[ "${dir}" == /* ]] || dir="${PWD}/${dir}"
+  probe="${dir}"
+  while [[ ! -d "${probe}" ]]; do
+    case "$(basename "${probe}")" in
+      ..|.) tf_fail "${1}: no se admiten '.' ni '..' en la parte que aún no existe." ;;
+    esac
+    rest="/$(basename "${probe}")${rest}"
+    probe="$(dirname "${probe}")"
+  done
+  real="$(cd "${probe}" && pwd -P)" || tf_fail "No se pudo resolver ${1}."
+  real="${real%/}${rest}"
+  case "${real}/" in
+    "${TF_LIB_REPO_ROOT}/"*)
+      tf_fail "${1} está dentro del clon (${TF_LIB_REPO_ROOT}): los respaldos del state deben quedar fuera del repositorio." ;;
+  esac
+}
+
 # backup_state <directorio_terraform> <nombre_stack>
 # Copia el state fuera del clon con permisos 600 antes del apply.
 #   - Backend local: copia terraform.tfstate* y deja el original en 600.
@@ -176,10 +201,17 @@ tf_init() {
 #     cuentan como "no existe".
 backup_state() {
   local tf_dir="$1" stack="$2" dest
-  dest="${TFSTATE_BACKUP_DIR:-${HOME}/tfstate-backups}/${stack}/$(date +%Y%m%d-%H%M%S)-$$"
+  local base="${TFSTATE_BACKUP_DIR:-${HOME}/tfstate-backups}"
+  tf_require_outside_repo "${base}"
+  dest="${base}/${stack}/$(date +%Y%m%d-%H%M%S)-$$"
 
   if tf_backend_is_s3 "${tf_dir}"; then
     (umask 077; mkdir -p "${dest}")
+    # Una interrupción entre el pull y el mv no deja el state en claro a medias.
+    # shellcheck disable=SC2064  # se expande ahora a propósito
+    trap "rm -f '${dest}/remote.tfstate.partial'" EXIT
+    # shellcheck disable=SC2064
+    trap "rm -f '${dest}/remote.tfstate.partial'; exit 130" INT TERM
     if ! (umask 077; terraform -chdir="${tf_dir}" state pull > "${dest}/remote.tfstate.partial"); then
       rm -f "${dest}/remote.tfstate.partial"
       tf_fail "terraform state pull falló en ${stack}: error del backend o de credenciales. No se continúa."
@@ -188,6 +220,7 @@ backup_state() {
       || grep -Eq '"lineage"[[:space:]]*:[[:space:]]*""' "${dest}/remote.tfstate.partial"; then
       rm -f "${dest}/remote.tfstate.partial"
       rmdir "${dest}" 2>/dev/null || true
+      trap - EXIT INT TERM
       if [[ "${ALLOW_EMPTY_STATE:-0}" == "1" ]]; then
         TF_STATE_EMPTY=1
         # shellcheck disable=SC2034  # la leen vector-infraestructura y rag/infrastructure (deploy.sh)
@@ -199,6 +232,7 @@ backup_state() {
   ALLOW_EMPTY_STATE=1; si no, revisar bucket y key antes de cualquier apply."
     fi
     mv "${dest}/remote.tfstate.partial" "${dest}/remote.tfstate"
+    trap - EXIT INT TERM
     chmod 600 "${dest}/remote.tfstate"
     echo "✓ State remoto respaldado en ${dest}/remote.tfstate"
     return 0

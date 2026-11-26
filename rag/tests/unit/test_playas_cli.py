@@ -43,6 +43,7 @@ STACKS = {
 FAKE_TERRAFORM = """#!/usr/bin/env bash
 echo "terraform $*" >> "${CALL_LOG}"
 case "$*" in
+  "version") echo "Terraform v${FAKE_TF_VERSION:-1.17.1}"; echo "on linux_amd64" ;;
   *" workspace show"*) echo default ;;
   *" state pull"*) printf '%s' "${FAKE_STATE_PULL-}" ;;
   *" output -raw s3_bucket_name"*) echo "rag-playas-data-123456789012" ;;
@@ -59,12 +60,27 @@ case "$*" in
     printf '%s\\t%s\\n' "${FAKE_ACCOUNT:-123456789012}" "arn:aws:sts::1:assumed-role/voclabs/user" ;;
   *"sts get-caller-identity"*) echo "${FAKE_ACCOUNT:-123456789012}" ;;
   *"configure get region"*) echo "us-east-1" ;;
+  *get-bucket-versioning*) echo Enabled ;;
+  *get-bucket-encryption*) echo AES256 ;;
+  *get-public-access-block*) printf 'True\tTrue\tTrue\tTrue\n' ;;
+  *get-bucket-ownership-controls*) echo BucketOwnerEnforced ;;
+  *get-bucket-policy*)
+    echo '{"Statement":[{"Effect":"Deny","Condition":{"Bool":{"aws:SecureTransport":"false"}}}]}' ;;
+  *"ec2 describe-instances"*) echo "127.0.0.1" ;;
+  *"elbv2 describe-load-balancers"*) printf 'arn:aws:lb/x\tdns.example\n' ;;
+  *"elbv2 describe-target-groups"*) echo "arn:aws:elasticloadbalancing:x:targetgroup/backend/1" ;;
+  *"elbv2 describe-target-health"*) printf '%b\n' "${FAKE_TG_HEALTH-healthy\thealthy}" ;;
 esac
 exit 0
 """
 
 # gpg falso: "cifra" invirtiendo el texto para poder comprobar que el
 # contenido en claro nunca aparece en disco.
+FAKE_CURL = """#!/usr/bin/env bash
+echo "curl $*" >> "${CALL_LOG}"
+exit 0
+"""
+
 FAKE_GPG = """#!/usr/bin/env bash
 echo "gpg $*" >> "${CALL_LOG}"
 out=""
@@ -112,11 +128,17 @@ def _run(
     tmp_path: Path,
     *args: str,
     tty: bool = False,
+    cwd: Path | None = None,
     stdin_text: str = "\x04",
     env_extra: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     bin_dir = tmp_path / "bin"
-    for name, body in (("terraform", FAKE_TERRAFORM), ("aws", FAKE_AWS), ("gpg", FAKE_GPG)):
+    for name, body in (
+        ("terraform", FAKE_TERRAFORM),
+        ("aws", FAKE_AWS),
+        ("gpg", FAKE_GPG),
+        ("curl", FAKE_CURL),
+    ):
         _write_exec(bin_dir / name, body)
     call_log = tmp_path / "calls.log"
     call_log.write_text("")
@@ -140,6 +162,7 @@ def _run(
             capture_output=True,
             text=True,
             env=env,
+            cwd=cwd,
             timeout=60,
         )
     finally:
@@ -325,22 +348,54 @@ def test_backup_state_encrypts_without_plaintext_on_disk(tmp_path: Path) -> None
     assert len(gpg_calls) == 1 and "--recipient ops@example.invalid" in gpg_calls[0]
 
 
-def test_backup_state_refuses_destination_inside_clone(tmp_path: Path) -> None:
+@pytest.mark.parametrize("kind", ["directo", "padre-inexistente", "symlink", "relativo"])
+def test_backup_state_refuses_destination_inside_clone(tmp_path: Path, kind: str) -> None:
     root = _tree(tmp_path)
+    cwd = None
+    if kind == "directo":
+        dest = str(root / "backups")
+    elif kind == "padre-inexistente":
+        dest = str(root / "nuevo" / "backups")
+    elif kind == "symlink":
+        link = tmp_path / "parece-fuera"
+        link.symlink_to(root / "rag", target_is_directory=True)
+        (root / "rag").mkdir(exist_ok=True)
+        dest = str(link / "backups")
+    else:
+        (root / "rag").mkdir(exist_ok=True)
+        cwd, dest = root / "rag", "backups/sub"
     result, calls = _run(
         root,
         tmp_path,
         "backup-state",
         "vector",
+        cwd=cwd,
         env_extra={
             "FAKE_STATE_PULL": REMOTE_STATE,
             "PLAYAS_BACKUP_GPG_RECIPIENT": "ops@example.invalid",
-            "PLAYAS_STATE_BACKUP_DIR": str(root / "backups"),
+            "PLAYAS_STATE_BACKUP_DIR": dest,
         },
     )
     assert result.returncode != 0
     assert "dentro del clon" in result.stderr
     assert not any("state pull" in c for c in calls)
+    assert not list(root.rglob("*.gpg"))
+
+
+def test_deploy_backup_dir_inside_clone_stops_before_apply(tmp_path: Path) -> None:
+    root = _ingesta_tree(tmp_path)
+    result, calls = _run(
+        root,
+        tmp_path,
+        "deploy",
+        "ingesta",
+        tty=True,
+        env_extra={"FAKE_STATE_PULL": REMOTE_STATE, "TFSTATE_BACKUP_DIR": str(root / "bk")},
+    )
+    assert result.returncode != 0
+    assert "dentro del clon" in result.stderr
+    assert not any("state pull" in c or " apply" in c for c in calls)
+    assert not list(root.rglob("remote.tfstate*"))
 
 
 def test_backup_state_skips_empty_state(tmp_path: Path) -> None:
@@ -380,6 +435,24 @@ def test_backup_state_without_recipient_requires_terminal(tmp_path: Path) -> Non
 # ---------------------------------------------------------------------------
 
 
+def test_doctor_healthy_setup_passes(tmp_path: Path) -> None:
+    result, calls = _run(_tree(tmp_path), tmp_path, "doctor")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "doctor: sin errores" in result.stdout
+    assert not any(re.search(r"aws s3api (create|put|delete)", c) for c in calls)
+
+
+@pytest.mark.parametrize(
+    ("version", "accepted"),
+    [("1.17.1", True), ("1.17.4", True), ("1.18.0", False), ("1.17.0", False)],
+)
+def test_doctor_terraform_version_follows_required_version(
+    tmp_path: Path, version: str, accepted: bool
+) -> None:
+    result, _ = _run(_tree(tmp_path), tmp_path, "doctor", env_extra={"FAKE_TF_VERSION": version})
+    assert (result.returncode == 0) is accepted, result.stdout + result.stderr
+
+
 def test_doctor_fails_without_backend_config(tmp_path: Path) -> None:
     root = _tree(tmp_path)
     (root / "backend.hcl").unlink()
@@ -388,7 +461,7 @@ def test_doctor_fails_without_backend_config(tmp_path: Path) -> None:
     assert "Falta backend.hcl" in result.stderr
     # doctor es de solo lectura.
     assert not any(re.search(r"aws s3api (create|put|delete)", c) for c in calls)
-    assert not any(c.startswith("terraform") and " version" not in c for c in calls)
+    assert not any(c.startswith("terraform") and c != "terraform version" for c in calls)
 
 
 def test_doctor_detects_wrong_data_bucket_contract(tmp_path: Path) -> None:
@@ -460,3 +533,23 @@ def test_ingesta_deploy_empty_state_needs_opt_in(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "ALLOW_EMPTY_STATE=1" in result.stderr
     assert not any(" apply" in c for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# health
+# ---------------------------------------------------------------------------
+
+
+def test_health_passes_when_everything_responds(tmp_path: Path) -> None:
+    result, calls = _run(_tree(tmp_path), tmp_path, "health")
+    assert result.returncode == 0, result.stdout + result.stderr
+    urls = [c for c in calls if c.startswith("curl")]
+    for path in (":8000/api/v2/heartbeat", ":11434/api/tags", "/api/health", "/api/ready"):
+        assert any(path in u for u in urls), path
+
+
+@pytest.mark.parametrize("states", ["healthy\\tunhealthy", "draining", ""])
+def test_health_fails_on_unhealthy_targets(tmp_path: Path, states: str) -> None:
+    result, _ = _run(_tree(tmp_path), tmp_path, "health", env_extra={"FAKE_TG_HEALTH": states})
+    assert result.returncode != 0
+    assert "comprobaciones fallidas" in result.stderr
